@@ -26,8 +26,12 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
+import com.amazonaws.services.s3.model.GetObjectTaggingRequest;
+import com.amazonaws.services.s3.model.GetObjectTaggingResult;
+import com.amazonaws.services.s3.model.Tag;
 import org.apache.nifi.annotation.behavior.InputRequirement;
 import org.apache.nifi.annotation.behavior.InputRequirement.Requirement;
+import org.apache.nifi.annotation.behavior.PrimaryNodeOnly;
 import org.apache.nifi.annotation.behavior.Stateful;
 import org.apache.nifi.annotation.behavior.TriggerSerially;
 import org.apache.nifi.annotation.behavior.TriggerWhenEmpty;
@@ -40,6 +44,7 @@ import org.apache.nifi.components.AllowableValue;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.state.Scope;
 import org.apache.nifi.components.state.StateMap;
+import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.flowfile.attributes.CoreAttributes;
 import org.apache.nifi.processor.ProcessContext;
@@ -57,6 +62,7 @@ import com.amazonaws.services.s3.model.VersionListing;
 import com.amazonaws.services.s3.model.ListObjectsV2Request;
 import com.amazonaws.services.s3.model.ListObjectsV2Result;
 
+@PrimaryNodeOnly
 @TriggerSerially
 @TriggerWhenEmpty
 @InputRequirement(Requirement.INPUT_FORBIDDEN)
@@ -77,14 +83,16 @@ import com.amazonaws.services.s3.model.ListObjectsV2Result;
         @WritesAttribute(attribute = "s3.lastModified", description = "The last modified time in milliseconds since epoch in UTC time"),
         @WritesAttribute(attribute = "s3.length", description = "The size of the object in bytes"),
         @WritesAttribute(attribute = "s3.storeClass", description = "The storage class of the object"),
-        @WritesAttribute(attribute = "s3.version", description = "The version of the object, if applicable")})
+        @WritesAttribute(attribute = "s3.version", description = "The version of the object, if applicable"),
+        @WritesAttribute(attribute = "s3.tag.___", description = "If 'Write Object Tags' is set to 'True', the tags associated to the S3 object that is being listed " +
+                "will be written as part of the flowfile attributes")})
 @SeeAlso({FetchS3Object.class, PutS3Object.class, DeleteS3Object.class})
 public class ListS3 extends AbstractS3Processor {
 
     public static final PropertyDescriptor DELIMITER = new PropertyDescriptor.Builder()
             .name("delimiter")
             .displayName("Delimiter")
-            .expressionLanguageSupported(false)
+            .expressionLanguageSupported(ExpressionLanguageScope.NONE)
             .required(false)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .description("The string used to delimit directories within the bucket. Please consult the AWS documentation " +
@@ -94,7 +102,7 @@ public class ListS3 extends AbstractS3Processor {
     public static final PropertyDescriptor PREFIX = new PropertyDescriptor.Builder()
             .name("prefix")
             .displayName("Prefix")
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
             .required(false)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .description("The prefix used to filter the object list. In most cases, it should end with a forward slash ('/').")
@@ -103,7 +111,7 @@ public class ListS3 extends AbstractS3Processor {
     public static final PropertyDescriptor USE_VERSIONS = new PropertyDescriptor.Builder()
             .name("use-versions")
             .displayName("Use Versions")
-            .expressionLanguageSupported(false)
+            .expressionLanguageSupported(ExpressionLanguageScope.NONE)
             .required(true)
             .addValidator(StandardValidators.BOOLEAN_VALIDATOR)
             .allowableValues("true", "false")
@@ -114,7 +122,7 @@ public class ListS3 extends AbstractS3Processor {
     public static final PropertyDescriptor LIST_TYPE = new PropertyDescriptor.Builder()
             .name("list-type")
             .displayName("List Type")
-            .expressionLanguageSupported(false)
+            .expressionLanguageSupported(ExpressionLanguageScope.NONE)
             .required(true)
             .addValidator(StandardValidators.INTEGER_VALIDATOR)
             .allowableValues(
@@ -124,10 +132,29 @@ public class ListS3 extends AbstractS3Processor {
             .description("Specifies whether to use the original List Objects or the newer List Objects Version 2 endpoint.")
             .build();
 
+    public static final PropertyDescriptor MIN_AGE = new PropertyDescriptor.Builder()
+            .name("min-age")
+            .displayName("Minimum Object Age")
+            .description("The minimum age that an S3 object must be in order to be considered; any object younger than this amount of time (according to last modification date) will be ignored")
+            .required(true)
+            .addValidator(StandardValidators.TIME_PERIOD_VALIDATOR)
+            .defaultValue("0 sec")
+            .build();
+
+    public static final PropertyDescriptor WRITE_OBJECT_TAGS = new PropertyDescriptor.Builder()
+            .name("write-s3-object-tags")
+            .displayName("Write Object Tags")
+            .description("If set to 'True', the tags associated with the S3 object will be written as FlowFile attributes")
+            .required(true)
+            .allowableValues(new AllowableValue("true", "True"), new AllowableValue("false", "False"))
+            .defaultValue("false")
+            .build();
+
     public static final List<PropertyDescriptor> properties = Collections.unmodifiableList(
-            Arrays.asList(BUCKET, REGION, ACCESS_KEY, SECRET_KEY, CREDENTIALS_FILE,
+            Arrays.asList(BUCKET, REGION, ACCESS_KEY, SECRET_KEY, WRITE_OBJECT_TAGS, CREDENTIALS_FILE,
                     AWS_CREDENTIALS_PROVIDER_SERVICE, TIMEOUT, SSL_CONTEXT_SERVICE, ENDPOINT_OVERRIDE,
-                    SIGNER_OVERRIDE, PROXY_HOST, PROXY_HOST_PORT, DELIMITER, PREFIX, USE_VERSIONS, LIST_TYPE));
+                    SIGNER_OVERRIDE, PROXY_CONFIGURATION_SERVICE, PROXY_HOST, PROXY_HOST_PORT, PROXY_USERNAME,
+                    PROXY_PASSWORD, DELIMITER, PREFIX, USE_VERSIONS, LIST_TYPE, MIN_AGE));
 
     public static final Set<Relationship> relationships = Collections.unmodifiableSet(
             new HashSet<>(Collections.singletonList(REL_SUCCESS)));
@@ -197,6 +224,8 @@ public class ListS3 extends AbstractS3Processor {
 
         final long startNanos = System.nanoTime();
         final String bucket = context.getProperty(BUCKET).evaluateAttributeExpressions().getValue();
+        final long minAgeMilliseconds = context.getProperty(MIN_AGE).asTimePeriod(TimeUnit.MILLISECONDS);
+        final long listingTimestamp = System.currentTimeMillis();
 
         final AmazonS3 client = getClient();
         int listCount = 0;
@@ -227,7 +256,8 @@ public class ListS3 extends AbstractS3Processor {
             for (S3VersionSummary versionSummary : versionListing.getVersionSummaries()) {
                 long lastModified = versionSummary.getLastModified().getTime();
                 if (lastModified < currentTimestamp
-                        || lastModified == currentTimestamp && currentKeys.contains(versionSummary.getKey())) {
+                        || lastModified == currentTimestamp && currentKeys.contains(versionSummary.getKey())
+                        || lastModified > (listingTimestamp - minAgeMilliseconds)) {
                     continue;
                 }
 
@@ -245,6 +275,10 @@ public class ListS3 extends AbstractS3Processor {
                 attributes.put("s3.isLatest", String.valueOf(versionSummary.isLatest()));
                 if (versionSummary.getVersionId() != null) {
                     attributes.put("s3.version", versionSummary.getVersionId());
+                }
+
+                if (context.getProperty(WRITE_OBJECT_TAGS).asBoolean()) {
+                    attributes.putAll(writeObjectTags(client, versionSummary));
                 }
 
                 // Create the flowfile
@@ -289,6 +323,20 @@ public class ListS3 extends AbstractS3Processor {
             persistState(context);
         }
         return willCommit;
+    }
+
+    private Map<String, String> writeObjectTags(AmazonS3 client, S3VersionSummary versionSummary) {
+        final GetObjectTaggingResult taggingResult = client.getObjectTagging(new GetObjectTaggingRequest(versionSummary.getBucketName(), versionSummary.getKey()));
+        final Map<String, String> tagMap = new HashMap<>();
+
+        if (taggingResult != null) {
+            final List<Tag> tags = taggingResult.getTagSet();
+
+            for (final Tag tag : tags) {
+                tagMap.put("s3.tag." + tag.getKey(), tag.getValue());
+            }
+        }
+        return tagMap;
     }
 
     private interface S3BucketLister {

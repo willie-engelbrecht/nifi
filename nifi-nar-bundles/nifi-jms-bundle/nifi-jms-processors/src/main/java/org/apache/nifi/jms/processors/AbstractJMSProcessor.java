@@ -16,6 +16,7 @@
  */
 package org.apache.nifi.jms.processors;
 
+import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
@@ -27,6 +28,7 @@ import javax.jms.ConnectionFactory;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.annotation.lifecycle.OnStopped;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.jms.cf.JMSConnectionFactoryProvider;
 import org.apache.nifi.jms.cf.JMSConnectionFactoryProviderDefinition;
 import org.apache.nifi.processor.AbstractProcessor;
@@ -51,6 +53,8 @@ abstract class AbstractJMSProcessor<T extends JMSWorker> extends AbstractProcess
 
     static final String QUEUE = "QUEUE";
     static final String TOPIC = "TOPIC";
+    static final String TEXT_MESSAGE = "text";
+    static final String BYTES_MESSAGE = "bytes";
 
     static final PropertyDescriptor USER = new PropertyDescriptor.Builder()
             .name("User Name")
@@ -70,11 +74,11 @@ abstract class AbstractJMSProcessor<T extends JMSWorker> extends AbstractProcess
             .description("The name of the JMS Destination. Usually provided by the administrator (e.g., 'topic://myTopic' or 'myTopic').")
             .required(true)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
     static final PropertyDescriptor DESTINATION_TYPE = new PropertyDescriptor.Builder()
             .name("Destination Type")
-            .description("The type of the JMS Destination. Could be one of 'QUEUE' or 'TOPIC'. Usually provided by the administrator. Defaults to 'TOPIC")
+            .description("The type of the JMS Destination. Could be one of 'QUEUE' or 'TOPIC'. Usually provided by the administrator. Defaults to 'QUEUE'")
             .required(true)
             .allowableValues(QUEUE, TOPIC)
             .defaultValue(QUEUE)
@@ -87,7 +91,7 @@ abstract class AbstractJMSProcessor<T extends JMSWorker> extends AbstractProcess
                          "Please see JMS spec for further details")
             .required(false)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
             .build();
     static final PropertyDescriptor SESSION_CACHE_SIZE = new PropertyDescriptor.Builder()
             .name("Session Cache size")
@@ -95,6 +99,23 @@ abstract class AbstractJMSProcessor<T extends JMSWorker> extends AbstractProcess
             .required(false)
             .defaultValue("1")
             .addValidator(StandardValidators.NON_NEGATIVE_INTEGER_VALIDATOR)
+            .build();
+    static final PropertyDescriptor MESSAGE_BODY = new PropertyDescriptor.Builder()
+            .name("message-body-type")
+            .displayName("Message Body Type")
+            .description("The type of JMS message body to construct.")
+            .required(true)
+            .defaultValue(BYTES_MESSAGE)
+            .allowableValues(BYTES_MESSAGE, TEXT_MESSAGE)
+            .build();
+    public static final PropertyDescriptor CHARSET = new PropertyDescriptor.Builder()
+            .name("character-set")
+            .displayName("Character Set")
+            .description("The name of the character set to use to construct or interpret TextMessages")
+            .required(true)
+            .addValidator(StandardValidators.CHARACTER_SET_VALIDATOR)
+            .defaultValue(Charset.defaultCharset().name())
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 
 
@@ -117,6 +138,8 @@ abstract class AbstractJMSProcessor<T extends JMSWorker> extends AbstractProcess
         propertyDescriptors.add(PASSWORD);
         propertyDescriptors.add(CLIENT_ID);
         propertyDescriptors.add(SESSION_CACHE_SIZE);
+        propertyDescriptors.add(MESSAGE_BODY);
+        propertyDescriptors.add(CHARSET);
     }
 
     @Override

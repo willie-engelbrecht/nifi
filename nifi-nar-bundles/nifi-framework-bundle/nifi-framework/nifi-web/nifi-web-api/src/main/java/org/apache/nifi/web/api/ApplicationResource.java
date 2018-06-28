@@ -23,6 +23,7 @@ import org.apache.nifi.authorization.AuthorizableLookup;
 import org.apache.nifi.authorization.AuthorizeAccess;
 import org.apache.nifi.authorization.AuthorizeControllerServiceReference;
 import org.apache.nifi.authorization.Authorizer;
+import org.apache.nifi.authorization.ComponentAuthorizable;
 import org.apache.nifi.authorization.ProcessGroupAuthorizable;
 import org.apache.nifi.authorization.RequestAction;
 import org.apache.nifi.authorization.SnippetAuthorizable;
@@ -98,6 +99,7 @@ public abstract class ApplicationResource {
 
     public static final String VERSION = "version";
     public static final String CLIENT_ID = "clientId";
+    public static final String DISCONNECTED_NODE_ACKNOWLEDGED = "disconnectedNodeAcknowledged";
 
     public static final String PROXY_SCHEME_HTTP_HEADER = "X-ProxyScheme";
     public static final String PROXY_HOST_HTTP_HEADER = "X-ProxyHost";
@@ -136,6 +138,11 @@ public abstract class ApplicationResource {
      * @return resource uri
      */
     protected String generateResourceUri(final String... path) {
+        URI uri = buildResourceUri(path);
+        return uri.toString();
+    }
+
+    private URI buildResourceUri(final String... path) {
         final UriBuilder uriBuilder = uriInfo.getBaseUriBuilder();
         uriBuilder.segment(path);
         URI uri = uriBuilder.build();
@@ -178,7 +185,7 @@ public abstract class ApplicationResource {
         } catch (final URISyntaxException use) {
             throw new UriBuilderException(use);
         }
-        return uri.toString();
+        return uri;
     }
 
     /**
@@ -445,6 +452,16 @@ public abstract class ApplicationResource {
      */
     protected Revision getRevision(final ComponentEntity entity, final String componentId) {
         return getRevision(entity.getRevision(), componentId);
+    }
+
+    /**
+     * Authorize any restrictions for the specified ComponentAuthorizable.
+     *
+     * @param authorizer                authorizer
+     * @param authorizable              component authorizable
+     */
+    protected void authorizeRestrictions(final Authorizer authorizer, final ComponentAuthorizable authorizable) {
+        authorizable.getRestrictedAuthorizables().forEach(restrictionAuthorizable -> restrictionAuthorizable.authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser()));
     }
 
     /**
@@ -1042,6 +1059,17 @@ public abstract class ApplicationResource {
         return clusterCoordinator != null;
     }
 
+    boolean isDisconnectedFromCluster() {
+        return isClustered() && !clusterCoordinator.isConnected();
+    }
+
+    void verifyDisconnectedNodeModification(final Boolean disconnectionAcknowledged) {
+        if (!Boolean.TRUE.equals(disconnectionAcknowledged)) {
+            throw new IllegalArgumentException("This node is disconnected from its configured cluster. The requested change "
+                    + "will only be allowed if the flag to acknowledge the disconnected node is set.");
+        }
+    }
+
     public void setRequestReplicator(final RequestReplicator requestReplicator) {
         this.requestReplicator = requestReplicator;
     }
@@ -1215,9 +1243,9 @@ public abstract class ApplicationResource {
         public Response locationResponse(UriInfo uriInfo, String portType, String portId, String transactionId, Object entity,
                                          Integer protocolVersion, final HttpRemoteSiteListener transactionManager) {
 
-            String path = "/data-transfer/" + portType + "/" + portId + "/transactions/" + transactionId;
-            URI location = uriInfo.getBaseUriBuilder().path(path).build();
-            return noCache(setCommonHeaders(Response.created(location), protocolVersion, transactionManager)
+            final URI transactionUri = buildResourceUri("data-transfer", portType, portId, "transactions", transactionId);
+
+            return noCache(setCommonHeaders(Response.created(transactionUri), protocolVersion, transactionManager)
                     .header(LOCATION_URI_INTENT_NAME, LOCATION_URI_INTENT_VALUE))
                     .entity(entity).build();
         }

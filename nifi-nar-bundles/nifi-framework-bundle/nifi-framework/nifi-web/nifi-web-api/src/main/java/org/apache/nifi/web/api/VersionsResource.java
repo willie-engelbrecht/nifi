@@ -17,31 +17,23 @@
 
 package org.apache.nifi.web.api;
 
-import javax.ws.rs.Consumes;
-import javax.ws.rs.DELETE;
-import javax.ws.rs.DefaultValue;
-import javax.ws.rs.GET;
-import javax.ws.rs.HttpMethod;
-import javax.ws.rs.POST;
-import javax.ws.rs.PUT;
-import javax.ws.rs.Path;
-import javax.ws.rs.PathParam;
-import javax.ws.rs.Produces;
-import javax.ws.rs.QueryParam;
-import javax.ws.rs.core.MediaType;
-import javax.ws.rs.core.MultivaluedHashMap;
-import javax.ws.rs.core.Response;
-import javax.ws.rs.core.Response.Status;
-
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiOperation;
+import io.swagger.annotations.ApiParam;
+import io.swagger.annotations.ApiResponse;
+import io.swagger.annotations.ApiResponses;
+import io.swagger.annotations.Authorization;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.nifi.authorization.AccessDeniedException;
 import org.apache.nifi.authorization.Authorizer;
+import org.apache.nifi.authorization.ComponentAuthorizable;
 import org.apache.nifi.authorization.ProcessGroupAuthorizable;
 import org.apache.nifi.authorization.RequestAction;
 import org.apache.nifi.authorization.resource.Authorizable;
 import org.apache.nifi.authorization.user.NiFiUser;
 import org.apache.nifi.authorization.user.NiFiUserUtils;
 import org.apache.nifi.cluster.manager.NodeResponse;
+import org.apache.nifi.components.ConfigurableComponent;
 import org.apache.nifi.controller.FlowController;
 import org.apache.nifi.controller.ScheduledState;
 import org.apache.nifi.controller.service.ControllerServiceState;
@@ -85,6 +77,21 @@ import org.apache.nifi.web.util.LifecycleManagementException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.ws.rs.Consumes;
+import javax.ws.rs.DELETE;
+import javax.ws.rs.DefaultValue;
+import javax.ws.rs.GET;
+import javax.ws.rs.HttpMethod;
+import javax.ws.rs.POST;
+import javax.ws.rs.PUT;
+import javax.ws.rs.Path;
+import javax.ws.rs.PathParam;
+import javax.ws.rs.Produces;
+import javax.ws.rs.QueryParam;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.MultivaluedHashMap;
+import javax.ws.rs.core.Response;
+import javax.ws.rs.core.Response.Status;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -99,13 +106,6 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
-
-import io.swagger.annotations.Api;
-import io.swagger.annotations.ApiOperation;
-import io.swagger.annotations.ApiParam;
-import io.swagger.annotations.ApiResponse;
-import io.swagger.annotations.ApiResponses;
-import io.swagger.annotations.Authorization;
 
 @Path("/versions")
 @Api(value = "/versions", description = "Endpoint for managing version control for a flow")
@@ -175,11 +175,12 @@ public class VersionsResource extends ApplicationResource {
     @Produces(MediaType.TEXT_PLAIN)
     @Path("active-requests")
     @ApiOperation(
-        value = "Creates a request so that a Process Group can be placed under Version Control or have its Version Control configuration changed. Creating this request will "
-            + "prevent any other threads from simultaneously saving local changes to Version Control. It will not, however, actually save the local flow to the Flow Registry. A "
-            + "POST to /versions/process-groups/{id} should be used to initiate saving of the local flow to the Flow Registry.",
+        value = "Create a version control request",
             response = String.class,
-        notes = NON_GUARANTEED_ENDPOINT,
+        notes = "Creates a request so that a Process Group can be placed under Version Control or have its Version Control configuration changed. Creating this request will "
+            + "prevent any other threads from simultaneously saving local changes to Version Control. It will not, however, actually save the local flow to the Flow Registry. A "
+            + "POST to /versions/process-groups/{id} should be used to initiate saving of the local flow to the Flow Registry. "
+            + NON_GUARANTEED_ENDPOINT,
         authorizations = {
             @Authorization(value = "Write - /process-groups/{uuid}")
         })
@@ -199,6 +200,8 @@ public class VersionsResource extends ApplicationResource {
 
         if (isReplicateRequest()) {
             return replicate(HttpMethod.POST, requestEntity);
+        } else if (isDisconnectedFromCluster()) {
+            verifyDisconnectedNodeModification(requestEntity.isDisconnectedNodeAcknowledged());
         }
 
         final NiFiUser user = NiFiUserUtils.getNiFiUser();
@@ -287,6 +290,8 @@ public class VersionsResource extends ApplicationResource {
         // Replicate if necessary
         if (isReplicateRequest()) {
             return replicate(HttpMethod.PUT, requestEntity);
+        } else if (isDisconnectedFromCluster()) {
+            verifyDisconnectedNodeModification(requestEntity.isDisconnectedNodeAcknowledged());
         }
 
         // Perform the update
@@ -348,9 +353,10 @@ public class VersionsResource extends ApplicationResource {
     @Produces(MediaType.APPLICATION_JSON)
     @Path("active-requests/{id}")
     @ApiOperation(
-            value = "Deletes the Version Control Request with the given ID. This will allow other threads to save flows to the Flow Registry. See also the documentation "
-                + "for POSTing to /versions/active-requests for information regarding why this is done.",
-            notes = NON_GUARANTEED_ENDPOINT,
+            value = "Deletes the version control request with the given ID",
+            notes = "Deletes the Version Control Request with the given ID. This will allow other threads to save flows to the Flow Registry. See also the documentation "
+                + "for POSTing to /versions/active-requests for information regarding why this is done. "
+                + NON_GUARANTEED_ENDPOINT,
             authorizations = {
                 @Authorization(value = "Only the user that submitted the request can remove it")
             })
@@ -361,9 +367,18 @@ public class VersionsResource extends ApplicationResource {
         @ApiResponse(code = 404, message = "The specified resource could not be found."),
         @ApiResponse(code = 409, message = "The request was valid but NiFi was not in the appropriate state to process it. Retrying the same request later may be successful.")
     })
-    public Response deleteVersionControlRequest(@ApiParam("The request ID.") @PathParam("id") final String requestId) {
+    public Response deleteVersionControlRequest(
+            @ApiParam(
+                    value = "Acknowledges that this node is disconnected to allow for mutable requests to proceed.",
+                    required = false
+            )
+            @QueryParam(DISCONNECTED_NODE_ACKNOWLEDGED) @DefaultValue("false") final Boolean disconnectedNodeAcknowledged,
+            @ApiParam("The request ID.") @PathParam("id") final String requestId) {
+
         if (isReplicateRequest()) {
             return replicate(HttpMethod.DELETE);
+        } else if (isDisconnectedFromCluster()) {
+            verifyDisconnectedNodeModification(disconnectedNodeAcknowledged);
         }
 
         synchronized (activeRequestMonitor) {
@@ -404,10 +419,11 @@ public class VersionsResource extends ApplicationResource {
     @Produces(MediaType.APPLICATION_JSON)
     @Path("process-groups/{id}")
     @ApiOperation(
-            value = "Begins version controlling the Process Group with the given ID or commits changes to the Versioned Flow, "
-                + "depending on if the provided VersionControlInformation includes a flowId",
+            value = "Save the Process Group with the given ID",
             response = VersionControlInformationEntity.class,
-            notes = NON_GUARANTEED_ENDPOINT,
+            notes = "Begins version controlling the Process Group with the given ID or commits changes to the Versioned Flow, "
+                + "depending on if the provided VersionControlInformation includes a flowId. "
+                + NON_GUARANTEED_ENDPOINT,
             authorizations = {
                 @Authorization(value = "Read - /process-groups/{uuid}"),
                 @Authorization(value = "Write - /process-groups/{uuid}"),
@@ -452,6 +468,10 @@ public class VersionsResource extends ApplicationResource {
         }
         if (versionedFlowDto.getComments() != null && versionedFlowDto.getComments().length() > 65535) {
             throw new IllegalArgumentException("Comments cannot exceed 65,535 characters");
+        }
+
+        if (isDisconnectedFromCluster()) {
+            verifyDisconnectedNodeModification(requestEntity.isDisconnectedNodeAcknowledged());
         }
 
         // ensure we're not attempting to version the root group
@@ -644,9 +664,10 @@ public class VersionsResource extends ApplicationResource {
     @Produces(MediaType.APPLICATION_JSON)
     @Path("process-groups/{id}")
     @ApiOperation(
-            value = "Stops version controlling the Process Group with the given ID. The Process Group will no longer track to any Versioned Flow.",
+            value = "Stops version controlling the Process Group with the given ID",
             response = VersionControlInformationEntity.class,
-            notes = NON_GUARANTEED_ENDPOINT,
+            notes = "Stops version controlling the Process Group with the given ID. The Process Group will no longer track to any Versioned Flow. "
+                + NON_GUARANTEED_ENDPOINT,
             authorizations = {
                 @Authorization(value = "Read - /process-groups/{uuid}"),
                 @Authorization(value = "Write - /process-groups/{uuid}"),
@@ -667,10 +688,17 @@ public class VersionsResource extends ApplicationResource {
                 value = "If the client id is not specified, a new one will be generated. This value (whether specified or generated) is included in the response.",
                 required = false)
         @QueryParam(CLIENT_ID) @DefaultValue(StringUtils.EMPTY) final ClientIdParameter clientId,
+        @ApiParam(
+                value = "Acknowledges that this node is disconnected to allow for mutable requests to proceed.",
+                required = false
+        )
+        @QueryParam(DISCONNECTED_NODE_ACKNOWLEDGED) @DefaultValue("false") final Boolean disconnectedNodeAcknowledged,
         @ApiParam("The process group id.") @PathParam("id") final String groupId) {
 
         if (isReplicateRequest()) {
             return replicate(HttpMethod.DELETE);
+        } else if (isDisconnectedFromCluster()) {
+            verifyDisconnectedNodeModification(disconnectedNodeAcknowledged);
         }
 
         final Revision requestRevision = new Revision(version == null ? null : version.getLong(), clientId.getClientId(), groupId);
@@ -704,10 +732,11 @@ public class VersionsResource extends ApplicationResource {
     @Produces(MediaType.APPLICATION_JSON)
     @Path("process-groups/{id}")
     @ApiOperation(
-            value = "For a Process Group that is already under Version Control, this will update the version of the flow to a different version. This endpoint expects "
-                + "that the given snapshot will not modify any Processor that is currently running or any Controller Service that is enabled.",
+            value = "Update the version of a Process Group with the given ID",
             response = VersionControlInformationEntity.class,
-            notes = NON_GUARANTEED_ENDPOINT,
+            notes = "For a Process Group that is already under Version Control, this will update the version of the flow to a different version. This endpoint expects "
+                + "that the given snapshot will not modify any Processor that is currently running or any Controller Service that is enabled. "
+                + NON_GUARANTEED_ENDPOINT,
             authorizations = {
                 @Authorization(value = "Read - /process-groups/{uuid}"),
                 @Authorization(value = "Write - /process-groups/{uuid}")
@@ -747,6 +776,8 @@ public class VersionsResource extends ApplicationResource {
         // Perform the request
         if (isReplicateRequest()) {
             return replicate(HttpMethod.PUT, requestEntity);
+        } else if (isDisconnectedFromCluster()) {
+            verifyDisconnectedNodeModification(requestEntity.isDisconnectedNodeAcknowledged());
         }
 
         final Revision requestRevision = getRevision(requestEntity.getProcessGroupRevision(), groupId);
@@ -789,8 +820,7 @@ public class VersionsResource extends ApplicationResource {
                 final VersionedFlowState flowState = snapshotMetadata.getVersion() == flow.getVersionCount() ? VersionedFlowState.UP_TO_DATE : VersionedFlowState.STALE;
                 versionControlInfoDto.setState(flowState.name());
 
-                final NiFiUser user = NiFiUserUtils.getNiFiUser();
-                final ProcessGroupEntity updatedGroup = serviceFacade.updateProcessGroupContents(user, rev, groupId, versionControlInfoDto, flowSnapshot, getIdGenerationSeed().orElse(null), false,
+                final ProcessGroupEntity updatedGroup = serviceFacade.updateProcessGroupContents(rev, groupId, versionControlInfoDto, flowSnapshot, getIdGenerationSeed().orElse(null), false,
                     true, entity.getUpdateDescendantVersionedFlows());
                 final VersionControlInformationDTO updatedVci = updatedGroup.getComponent().getVersionControlInformation();
 
@@ -808,11 +838,12 @@ public class VersionsResource extends ApplicationResource {
     @Produces(MediaType.APPLICATION_JSON)
     @Path("update-requests/{id}")
     @ApiOperation(
-            value = "Returns the Update Request with the given ID. Once an Update Request has been created by performing a POST to /versions/update-requests/process-groups/{id}, "
-                + "that request can subsequently be retrieved via this endpoint, and the request that is fetched will contain the updated state, such as percent complete, the "
-                + "current state of the request, and any failures.",
+            value = "Returns the Update Request with the given ID",
             response = VersionedFlowUpdateRequestEntity.class,
-            notes = NON_GUARANTEED_ENDPOINT,
+            notes = "Returns the Update Request with the given ID. Once an Update Request has been created by performing a POST to /versions/update-requests/process-groups/{id}, "
+                + "that request can subsequently be retrieved via this endpoint, and the request that is fetched will contain the updated state, such as percent complete, the "
+                + "current state of the request, and any failures. "
+                + NON_GUARANTEED_ENDPOINT,
             authorizations = {
                 @Authorization(value = "Only the user that submitted the request can get it")
             })
@@ -832,11 +863,12 @@ public class VersionsResource extends ApplicationResource {
     @Produces(MediaType.APPLICATION_JSON)
     @Path("revert-requests/{id}")
     @ApiOperation(
-            value = "Returns the Revert Request with the given ID. Once a Revert Request has been created by performing a POST to /versions/revert-requests/process-groups/{id}, "
-                + "that request can subsequently be retrieved via this endpoint, and the request that is fetched will contain the updated state, such as percent complete, the "
-                + "current state of the request, and any failures.",
+            value = "Returns the Revert Request with the given ID",
             response = VersionedFlowUpdateRequestEntity.class,
-            notes = NON_GUARANTEED_ENDPOINT,
+            notes = "Returns the Revert Request with the given ID. Once a Revert Request has been created by performing a POST to /versions/revert-requests/process-groups/{id}, "
+                + "that request can subsequently be retrieved via this endpoint, and the request that is fetched will contain the updated state, such as percent complete, the "
+                + "current state of the request, and any failures. "
+                + NON_GUARANTEED_ENDPOINT,
             authorizations = {
                 @Authorization(value = "Only the user that submitted the request can get it")
             })
@@ -890,11 +922,12 @@ public class VersionsResource extends ApplicationResource {
     @Produces(MediaType.APPLICATION_JSON)
     @Path("update-requests/{id}")
     @ApiOperation(
-        value = "Deletes the Update Request with the given ID. After a request is created via a POST to /versions/update-requests/process-groups/{id}, it is expected "
-            + "that the client will properly clean up the request by DELETE'ing it, once the Update process has completed. If the request is deleted before the request "
-            + "completes, then the Update request will finish the step that it is currently performing and then will cancel any subsequent steps.",
+            value = "Deletes the Update Request with the given ID",
             response = VersionedFlowUpdateRequestEntity.class,
-            notes = NON_GUARANTEED_ENDPOINT,
+            notes = "Deletes the Update Request with the given ID. After a request is created via a POST to /versions/update-requests/process-groups/{id}, it is expected "
+                + "that the client will properly clean up the request by DELETE'ing it, once the Update process has completed. If the request is deleted before the request "
+                + "completes, then the Update request will finish the step that it is currently performing and then will cancel any subsequent steps. "
+                + NON_GUARANTEED_ENDPOINT,
             authorizations = {
                 @Authorization(value = "Only the user that submitted the request can remove it")
             })
@@ -905,8 +938,15 @@ public class VersionsResource extends ApplicationResource {
         @ApiResponse(code = 404, message = "The specified resource could not be found."),
         @ApiResponse(code = 409, message = "The request was valid but NiFi was not in the appropriate state to process it. Retrying the same request later may be successful.")
     })
-    public Response deleteUpdateRequest(@ApiParam("The ID of the Update Request") @PathParam("id") final String updateRequestId) {
-        return deleteRequest("update-requests", updateRequestId);
+    public Response deleteUpdateRequest(
+            @ApiParam(
+                    value = "Acknowledges that this node is disconnected to allow for mutable requests to proceed.",
+                    required = false
+            )
+            @QueryParam(DISCONNECTED_NODE_ACKNOWLEDGED) @DefaultValue("false") final Boolean disconnectedNodeAcknowledged,
+            @ApiParam("The ID of the Update Request") @PathParam("id") final String updateRequestId) {
+
+        return deleteRequest("update-requests", updateRequestId, disconnectedNodeAcknowledged.booleanValue());
     }
 
     @DELETE
@@ -914,11 +954,12 @@ public class VersionsResource extends ApplicationResource {
     @Produces(MediaType.APPLICATION_JSON)
     @Path("revert-requests/{id}")
     @ApiOperation(
-            value = "Deletes the Revert Request with the given ID. After a request is created via a POST to /versions/revert-requests/process-groups/{id}, it is expected "
-                + "that the client will properly clean up the request by DELETE'ing it, once the Revert process has completed. If the request is deleted before the request "
-            + "completes, then the Revert request will finish the step that it is currently performing and then will cancel any subsequent steps.",
+            value = "Deletes the Revert Request with the given ID",
             response = VersionedFlowUpdateRequestEntity.class,
-            notes = NON_GUARANTEED_ENDPOINT,
+            notes = "Deletes the Revert Request with the given ID. After a request is created via a POST to /versions/revert-requests/process-groups/{id}, it is expected "
+                + "that the client will properly clean up the request by DELETE'ing it, once the Revert process has completed. If the request is deleted before the request "
+                + "completes, then the Revert request will finish the step that it is currently performing and then will cancel any subsequent steps. "
+                + NON_GUARANTEED_ENDPOINT,
             authorizations = {
                 @Authorization(value = "Only the user that submitted the request can remove it")
             })
@@ -929,14 +970,25 @@ public class VersionsResource extends ApplicationResource {
         @ApiResponse(code = 404, message = "The specified resource could not be found."),
         @ApiResponse(code = 409, message = "The request was valid but NiFi was not in the appropriate state to process it. Retrying the same request later may be successful.")
     })
-    public Response deleteRevertRequest(@ApiParam("The ID of the Revert Request") @PathParam("id") final String revertRequestId) {
-        return deleteRequest("revert-requests", revertRequestId);
+    public Response deleteRevertRequest(
+            @ApiParam(
+                    value = "Acknowledges that this node is disconnected to allow for mutable requests to proceed.",
+                    required = false
+            )
+            @QueryParam(DISCONNECTED_NODE_ACKNOWLEDGED) @DefaultValue("false") final Boolean disconnectedNodeAcknowledged,
+            @ApiParam("The ID of the Revert Request") @PathParam("id") final String revertRequestId) {
+
+        return deleteRequest("revert-requests", revertRequestId, disconnectedNodeAcknowledged.booleanValue());
     }
 
 
-    private Response deleteRequest(final String requestType, final String requestId) {
+    private Response deleteRequest(final String requestType, final String requestId, final boolean disconnectedNodeAcknowledged) {
         if (requestId == null) {
             throw new IllegalArgumentException("Request ID must be specified.");
+        }
+
+        if (isDisconnectedFromCluster()) {
+            verifyDisconnectedNodeModification(disconnectedNodeAcknowledged);
         }
 
         final NiFiUser user = NiFiUserUtils.getNiFiUser();
@@ -982,15 +1034,15 @@ public class VersionsResource extends ApplicationResource {
     @Produces(MediaType.APPLICATION_JSON)
     @Path("update-requests/process-groups/{id}")
     @ApiOperation(
-            value = "For a Process Group that is already under Version Control, this will initiate the action of changing "
+            value = "Initiate the Update Request of a Process Group with the given ID",
+            response = VersionedFlowUpdateRequestEntity.class,
+            notes = "For a Process Group that is already under Version Control, this will initiate the action of changing "
                 + "from a specific version of the flow in the Flow Registry to a different version of the flow. This can be a lengthy "
                 + "process, as it will stop any Processors and disable any Controller Services necessary to perform the action and then restart them. As a result, "
                 + "the endpoint will immediately return a VersionedFlowUpdateRequestEntity, and the process of updating the flow will occur "
                 + "asynchronously in the background. The client may then periodically poll the status of the request by issuing a GET request to "
                 + "/versions/update-requests/{requestId}. Once the request is completed, the client is expected to issue a DELETE request to "
-                + "/versions/update-requests/{requestId}.",
-            response = VersionedFlowUpdateRequestEntity.class,
-            notes = NON_GUARANTEED_ENDPOINT,
+                + "/versions/update-requests/{requestId}. " + NON_GUARANTEED_ENDPOINT,
             authorizations = {
                 @Authorization(value = "Read - /process-groups/{uuid}"),
                 @Authorization(value = "Write - /process-groups/{uuid}"),
@@ -1036,6 +1088,10 @@ public class VersionsResource extends ApplicationResource {
         }
         if (requestVersionControlInfoDto.getVersion() == null) {
             throw new IllegalArgumentException("The Version of the flow must be supplied.");
+        }
+
+        if (isDisconnectedFromCluster()) {
+            verifyDisconnectedNodeModification(requestEntity.isDisconnectedNodeAcknowledged());
         }
 
         // We will perform the updating of the Versioned Flow in a background thread because it can be a long-running process.
@@ -1086,7 +1142,7 @@ public class VersionsResource extends ApplicationResource {
         BundleUtils.discoverCompatibleBundles(flowSnapshot.getFlowContents());
 
         // Step 1: Determine which components will be affected by updating the version
-        final Set<AffectedComponentEntity> affectedComponents = serviceFacade.getComponentsAffectedByVersionChange(groupId, flowSnapshot, user);
+        final Set<AffectedComponentEntity> affectedComponents = serviceFacade.getComponentsAffectedByVersionChange(groupId, flowSnapshot);
 
         // build a request wrapper
         final InitiateChangeFlowVersionRequestWrapper requestWrapper = new InitiateChangeFlowVersionRequestWrapper(requestEntity, componentLifecycle, getAbsolutePath(), affectedComponents,
@@ -1104,10 +1160,11 @@ public class VersionsResource extends ApplicationResource {
                 authorizeProcessGroup(groupAuthorizable, authorizer, lookup, RequestAction.WRITE, true, false, true, true);
 
                 final VersionedProcessGroup groupContents = flowSnapshot.getFlowContents();
-                final boolean containsRestrictedComponents = FlowRegistryUtils.containsRestrictedComponent(groupContents);
-                if (containsRestrictedComponents) {
-                    lookup.getRestrictedComponents().authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
-                }
+                final Set<ConfigurableComponent> restrictedComponents = FlowRegistryUtils.getRestrictedComponents(groupContents);
+                restrictedComponents.forEach(restrictedComponent -> {
+                    final ComponentAuthorizable restrictedComponentAuthorizable = lookup.getConfigurableComponent(restrictedComponent);
+                    authorizeRestrictions(authorizer, restrictedComponentAuthorizable);
+                });
             },
             () -> {
                 // Step 3: Verify that all components in the snapshot exist on all nodes
@@ -1127,7 +1184,7 @@ public class VersionsResource extends ApplicationResource {
                 final Consumer<AsynchronousWebRequest<VersionControlInformationEntity>> updateTask = vcur -> {
                     try {
                         final VersionControlInformationEntity updatedVersionControlEntity = updateFlowVersion(groupId, wrapper.getComponentLifecycle(), wrapper.getExampleUri(),
-                            wrapper.getAffectedComponents(), user, wrapper.isReplicateRequest(), revision, wrapper.getVersionControlInformationEntity(), wrapper.getFlowSnapshot(), request,
+                            wrapper.getAffectedComponents(), wrapper.isReplicateRequest(), revision, wrapper.getVersionControlInformationEntity(), wrapper.getFlowSnapshot(), request,
                             idGenerationSeed, true, true);
 
                         vcur.markComplete(updatedVersionControlEntity);
@@ -1171,16 +1228,16 @@ public class VersionsResource extends ApplicationResource {
     @Produces(MediaType.APPLICATION_JSON)
     @Path("revert-requests/process-groups/{id}")
     @ApiOperation(
-            value = "For a Process Group that is already under Version Control, this will initiate the action of reverting "
+            value = "Initiate the Revert Request of a Process Group with the given ID",
+            response = VersionedFlowUpdateRequestEntity.class,
+            notes = "For a Process Group that is already under Version Control, this will initiate the action of reverting "
                 + "any local changes that have been made to the Process Group since it was last synchronized with the Flow Registry. This will result in the "
                 + "flow matching the Versioned Flow that exists in the Flow Registry. This can be a lengthy "
                 + "process, as it will stop any Processors and disable any Controller Services necessary to perform the action and then restart them. As a result, "
                 + "the endpoint will immediately return a VersionedFlowUpdateRequestEntity, and the process of updating the flow will occur "
                 + "asynchronously in the background. The client may then periodically poll the status of the request by issuing a GET request to "
                 + "/versions/revert-requests/{requestId}. Once the request is completed, the client is expected to issue a DELETE request to "
-                + "/versions/revert-requests/{requestId}.",
-            response = VersionedFlowUpdateRequestEntity.class,
-            notes = NON_GUARANTEED_ENDPOINT,
+                + "/versions/revert-requests/{requestId}. " + NON_GUARANTEED_ENDPOINT,
             authorizations = {
                 @Authorization(value = "Read - /process-groups/{uuid}"),
                 @Authorization(value = "Write - /process-groups/{uuid}"),
@@ -1227,6 +1284,10 @@ public class VersionsResource extends ApplicationResource {
             throw new IllegalArgumentException("The Version of the flow must be supplied.");
         }
 
+        if (isDisconnectedFromCluster()) {
+            verifyDisconnectedNodeModification(requestEntity.isDisconnectedNodeAcknowledged());
+        }
+
         // We will perform the updating of the Versioned Flow in a background thread because it can be a long-running process.
         // In order to do this, we will need some parameters that are only available as Thread-Local variables to the current
         // thread, so we will gather the values for these parameters up front.
@@ -1242,7 +1303,7 @@ public class VersionsResource extends ApplicationResource {
         BundleUtils.discoverCompatibleBundles(flowSnapshot.getFlowContents());
 
         // Step 1: Determine which components will be affected by updating the version
-        final Set<AffectedComponentEntity> affectedComponents = serviceFacade.getComponentsAffectedByVersionChange(groupId, flowSnapshot, user);
+        final Set<AffectedComponentEntity> affectedComponents = serviceFacade.getComponentsAffectedByVersionChange(groupId, flowSnapshot);
 
         // build a request wrapper
         final InitiateChangeFlowVersionRequestWrapper requestWrapper = new InitiateChangeFlowVersionRequestWrapper(requestEntity, componentLifecycle, getAbsolutePath(), affectedComponents,
@@ -1260,10 +1321,11 @@ public class VersionsResource extends ApplicationResource {
                 authorizeProcessGroup(groupAuthorizable, authorizer, lookup, RequestAction.WRITE, true, false, true, true);
 
                 final VersionedProcessGroup groupContents = flowSnapshot.getFlowContents();
-                final boolean containsRestrictedComponents = FlowRegistryUtils.containsRestrictedComponent(groupContents);
-                if (containsRestrictedComponents) {
-                    lookup.getRestrictedComponents().authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
-                }
+                final Set<ConfigurableComponent> restrictedComponents = FlowRegistryUtils.getRestrictedComponents(groupContents);
+                restrictedComponents.forEach(restrictedComponent -> {
+                    final ComponentAuthorizable restrictedComponentAuthorizable = lookup.getConfigurableComponent(restrictedComponent);
+                    authorizeRestrictions(authorizer, restrictedComponentAuthorizable);
+                });
             },
             () -> {
                 // Step 3: Verify that all components in the snapshot exist on all nodes
@@ -1305,7 +1367,7 @@ public class VersionsResource extends ApplicationResource {
                 final Consumer<AsynchronousWebRequest<VersionControlInformationEntity>> updateTask = vcur -> {
                     try {
                         final VersionControlInformationEntity updatedVersionControlEntity = updateFlowVersion(groupId, wrapper.getComponentLifecycle(), wrapper.getExampleUri(),
-                            wrapper.getAffectedComponents(), user, wrapper.isReplicateRequest(), revision, versionControlInformationEntity, wrapper.getFlowSnapshot(), request,
+                            wrapper.getAffectedComponents(), wrapper.isReplicateRequest(), revision, versionControlInformationEntity, wrapper.getFlowSnapshot(), request,
                             idGenerationSeed, false, true);
 
                         vcur.markComplete(updatedVersionControlEntity);
@@ -1344,7 +1406,7 @@ public class VersionsResource extends ApplicationResource {
     }
 
     private VersionControlInformationEntity updateFlowVersion(final String groupId, final ComponentLifecycle componentLifecycle, final URI exampleUri,
-        final Set<AffectedComponentEntity> affectedComponents, final NiFiUser user, final boolean replicateRequest, final Revision revision, final VersionControlInformationEntity requestEntity,
+        final Set<AffectedComponentEntity> affectedComponents, final boolean replicateRequest, final Revision revision, final VersionControlInformationEntity requestEntity,
         final VersionedFlowSnapshot flowSnapshot, final AsynchronousWebRequest<VersionControlInformationEntity> asyncRequest, final String idGenerationSeed,
         final boolean verifyNotModified, final boolean updateDescendantVersionedFlows) throws LifecycleManagementException, ResumeFlowException {
 
@@ -1364,7 +1426,7 @@ public class VersionsResource extends ApplicationResource {
         logger.info("Stopping {} Processors", runningComponents.size());
         final CancellableTimedPause stopComponentsPause = new CancellableTimedPause(250, Long.MAX_VALUE, TimeUnit.MILLISECONDS);
         asyncRequest.setCancelCallback(stopComponentsPause::cancel);
-        componentLifecycle.scheduleComponents(exampleUri, user, groupId, runningComponents, ScheduledState.STOPPED, stopComponentsPause);
+        componentLifecycle.scheduleComponents(exampleUri, groupId, runningComponents, ScheduledState.STOPPED, stopComponentsPause);
 
         if (asyncRequest.isCancelled()) {
             return null;
@@ -1380,7 +1442,7 @@ public class VersionsResource extends ApplicationResource {
         logger.info("Disabling {} Controller Services", enabledServices.size());
         final CancellableTimedPause disableServicesPause = new CancellableTimedPause(250, Long.MAX_VALUE, TimeUnit.MILLISECONDS);
         asyncRequest.setCancelCallback(disableServicesPause::cancel);
-        componentLifecycle.activateControllerServices(exampleUri, user, groupId, enabledServices, ControllerServiceState.DISABLED, disableServicesPause);
+        componentLifecycle.activateControllerServices(exampleUri, groupId, enabledServices, ControllerServiceState.DISABLED, disableServicesPause);
 
         if (asyncRequest.isCancelled()) {
             return null;
@@ -1388,10 +1450,12 @@ public class VersionsResource extends ApplicationResource {
         asyncRequest.update(new Date(), "Updating Flow", 40);
 
         logger.info("Updating Process Group with ID {} to version {} of the Versioned Flow", groupId, flowSnapshot.getSnapshotMetadata().getVersion());
+
         // If replicating request, steps 10-12 are performed on each node individually, and this is accomplished
         // by replicating a PUT to /nifi-api/versions/process-groups/{groupId}
         try {
             if (replicateRequest) {
+                final NiFiUser user = NiFiUserUtils.getNiFiUser();
 
                 final URI updateUri;
                 try {
@@ -1459,7 +1523,7 @@ public class VersionsResource extends ApplicationResource {
                 vci.setVersion(metadata.getVersion());
                 vci.setState(flowSnapshot.isLatest() ? VersionedFlowState.UP_TO_DATE.name() : VersionedFlowState.STALE.name());
 
-                serviceFacade.updateProcessGroupContents(user, revision, groupId, vci, flowSnapshot, idGenerationSeed, verifyNotModified, false, updateDescendantVersionedFlows);
+                serviceFacade.updateProcessGroupContents(revision, groupId, vci, flowSnapshot, idGenerationSeed, verifyNotModified, false, updateDescendantVersionedFlows);
             }
         } finally {
             if (!asyncRequest.isCancelled()) {
@@ -1472,11 +1536,11 @@ public class VersionsResource extends ApplicationResource {
                 // Step 13. Re-enable all disabled controller services
                 final CancellableTimedPause enableServicesPause = new CancellableTimedPause(250, Long.MAX_VALUE, TimeUnit.MILLISECONDS);
                 asyncRequest.setCancelCallback(enableServicesPause::cancel);
-                final Set<AffectedComponentEntity> servicesToEnable = getUpdatedEntities(enabledServices, user);
+                final Set<AffectedComponentEntity> servicesToEnable = getUpdatedEntities(enabledServices);
                 logger.info("Successfully updated flow; re-enabling {} Controller Services", servicesToEnable.size());
 
                 try {
-                    componentLifecycle.activateControllerServices(exampleUri, user, groupId, servicesToEnable, ControllerServiceState.ENABLED, enableServicesPause);
+                    componentLifecycle.activateControllerServices(exampleUri, groupId, servicesToEnable, ControllerServiceState.ENABLED, enableServicesPause);
                 } catch (final IllegalStateException ise) {
                     // Component Lifecycle will re-enable the Controller Services only if they are valid. If IllegalStateException gets thrown, we need to provide
                     // a more intelligent error message as to exactly what happened, rather than indicate that the flow could not be updated.
@@ -1492,7 +1556,7 @@ public class VersionsResource extends ApplicationResource {
                 asyncRequest.update(new Date(), "Restarting Processors", 80);
 
                 // Step 14. Restart all components
-                final Set<AffectedComponentEntity> componentsToStart = getUpdatedEntities(runningComponents, user);
+                final Set<AffectedComponentEntity> componentsToStart = getUpdatedEntities(runningComponents);
 
                 // If there are any Remote Group Ports that are supposed to be started and have no connections, we want to remove those from our Set.
                 // This will happen if the Remote Group Port is transmitting when the version change happens but the new flow version does not have
@@ -1528,7 +1592,7 @@ public class VersionsResource extends ApplicationResource {
                 logger.info("Restarting {} Processors", componentsToStart.size());
 
                 try {
-                    componentLifecycle.scheduleComponents(exampleUri, user, groupId, componentsToStart, ScheduledState.RUNNING, startComponentsPause);
+                    componentLifecycle.scheduleComponents(exampleUri, groupId, componentsToStart, ScheduledState.RUNNING, startComponentsPause);
                 } catch (final IllegalStateException ise) {
                     // Component Lifecycle will restart the Processors only if they are valid. If IllegalStateException gets thrown, we need to provide
                     // a more intelligent error message as to exactly what happened, rather than indicate that the flow could not be updated.
@@ -1565,12 +1629,12 @@ public class VersionsResource extends ApplicationResource {
     }
 
 
-    private Set<AffectedComponentEntity> getUpdatedEntities(final Set<AffectedComponentEntity> originalEntities, final NiFiUser user) {
+    private Set<AffectedComponentEntity> getUpdatedEntities(final Set<AffectedComponentEntity> originalEntities) {
         final Set<AffectedComponentEntity> entities = new LinkedHashSet<>();
 
         for (final AffectedComponentEntity original : originalEntities) {
             try {
-                final AffectedComponentEntity updatedEntity = AffectedComponentUtils.updateEntity(original, serviceFacade, dtoFactory, user);
+                final AffectedComponentEntity updatedEntity = AffectedComponentUtils.updateEntity(original, serviceFacade, dtoFactory);
                 if (updatedEntity != null) {
                     entities.add(updatedEntity);
                 }

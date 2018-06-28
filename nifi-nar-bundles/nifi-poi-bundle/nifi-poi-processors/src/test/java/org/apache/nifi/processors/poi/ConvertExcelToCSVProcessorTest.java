@@ -20,7 +20,9 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import java.io.File;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.nifi.csv.CSVUtils;
 import org.apache.nifi.flowfile.attributes.CoreAttributes;
@@ -44,7 +46,10 @@ public class ConvertExcelToCSVProcessorTest {
     @Test
     public void testMultipleSheetsGeneratesMultipleFlowFiles() throws Exception {
 
-        testRunner.enqueue(new File("src/test/resources/TwoSheets.xlsx").toPath());
+        Map<String, String> attributes = new HashMap<String, String>();
+        attributes.put("test", "attribute");
+
+        testRunner.enqueue(new File("src/test/resources/TwoSheets.xlsx").toPath(), attributes);
         testRunner.run();
 
         testRunner.assertTransferCount(ConvertExcelToCSVProcessor.SUCCESS, 2);
@@ -59,6 +64,7 @@ public class ConvertExcelToCSVProcessorTest {
 
         //Since TestRunner.run() will create a random filename even if the attribute is set in enqueue manually we just check that "_{SHEETNAME}.csv is present
         assertTrue(ffSheetA.getAttribute(CoreAttributes.FILENAME.key()).endsWith("_TestSheetA.csv"));
+        assertTrue(ffSheetA.getAttribute("test").equals("attribute"));
 
         MockFlowFile ffSheetB = testRunner.getFlowFilesForRelationship(ConvertExcelToCSVProcessor.SUCCESS).get(1);
         Long rowsSheetB = new Long(ffSheetB.getAttribute(ConvertExcelToCSVProcessor.ROW_NUM));
@@ -68,6 +74,7 @@ public class ConvertExcelToCSVProcessorTest {
 
         //Since TestRunner.run() will create a random filename even if the attribute is set in enqueue manually we just check that "_{SHEETNAME}.csv is present
         assertTrue(ffSheetB.getAttribute(CoreAttributes.FILENAME.key()).endsWith("_TestSheetB.csv"));
+        assertTrue(ffSheetB.getAttribute("test").equals("attribute"));
 
     }
 
@@ -153,10 +160,68 @@ public class ConvertExcelToCSVProcessorTest {
     }
 
     @Test
+    public void testSkipRowsWithEL() throws Exception {
+        Map<String, String> attributes = new HashMap<String, String>();
+        attributes.put("rowsToSkip", "2");
+        testRunner.enqueue(new File("src/test/resources/dataformatting.xlsx").toPath(),attributes);
+
+        testRunner.setProperty(ConvertExcelToCSVProcessor.ROWS_TO_SKIP, "${rowsToSkip}");
+        testRunner.setProperty(ConvertExcelToCSVProcessor.FORMAT_VALUES, "true");
+
+        testRunner.run();
+
+        testRunner.assertTransferCount(ConvertExcelToCSVProcessor.SUCCESS, 1);
+        testRunner.assertTransferCount(ConvertExcelToCSVProcessor.ORIGINAL, 1);
+        testRunner.assertTransferCount(ConvertExcelToCSVProcessor.FAILURE, 0);
+
+        MockFlowFile ff = testRunner.getFlowFilesForRelationship(ConvertExcelToCSVProcessor.SUCCESS).get(0);
+        Long rowsSheet = new Long(ff.getAttribute(ConvertExcelToCSVProcessor.ROW_NUM));
+        assertEquals("Row count does match expected value.", "7", rowsSheet.toString());
+
+        ff.assertContentEquals("1234.46,12:00:00 PM,£   123.45\n" +
+                "1234.5,Sunday\\, January 01\\, 2017,¥   123.45\n" +
+                "1\\,234.46,1/1/17 12:00,$   1\\,023.45\n" +
+                "1\\,234.4560,12:00 PM,£   1\\,023.45\n" +
+                "9.88E+08,2017/01/01/ 12:00,¥   1\\,023.45\n" +
+                "9.877E+08,,\n" +
+                "9.8765E+08,,\n");
+    }
+
+    @Test
     public void testSkipColumns() throws Exception {
         testRunner.enqueue(new File("src/test/resources/dataformatting.xlsx").toPath());
 
         testRunner.setProperty(ConvertExcelToCSVProcessor.COLUMNS_TO_SKIP, "2");
+        testRunner.setProperty(ConvertExcelToCSVProcessor.FORMAT_VALUES, "true");
+
+        testRunner.run();
+
+        testRunner.assertTransferCount(ConvertExcelToCSVProcessor.SUCCESS, 1);
+        testRunner.assertTransferCount(ConvertExcelToCSVProcessor.ORIGINAL, 1);
+        testRunner.assertTransferCount(ConvertExcelToCSVProcessor.FAILURE, 0);
+
+        MockFlowFile ff = testRunner.getFlowFilesForRelationship(ConvertExcelToCSVProcessor.SUCCESS).get(0);
+        Long rowsSheet = new Long(ff.getAttribute(ConvertExcelToCSVProcessor.ROW_NUM));
+        assertTrue(rowsSheet == 9);
+
+        ff.assertContentEquals("Numbers,Money\n" +
+                "1234.456,$   123.45\n" +
+                "1234.46,£   123.45\n" +
+                "1234.5,¥   123.45\n" +
+                "1\\,234.46,$   1\\,023.45\n" +
+                "1\\,234.4560,£   1\\,023.45\n" +
+                "9.88E+08,¥   1\\,023.45\n" +
+                "9.877E+08,\n" +
+                "9.8765E+08,\n");
+    }
+
+    @Test
+    public void testSkipColumnsWithEL() throws Exception {
+        Map<String, String> attributes = new HashMap<String, String>();
+        attributes.put("columnsToSkip", "2");
+        testRunner.enqueue(new File("src/test/resources/dataformatting.xlsx").toPath(),attributes);
+
+        testRunner.setProperty(ConvertExcelToCSVProcessor.COLUMNS_TO_SKIP, "${columnsToSkip}");
         testRunner.setProperty(ConvertExcelToCSVProcessor.FORMAT_VALUES, "true");
 
         testRunner.run();

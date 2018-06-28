@@ -23,14 +23,15 @@
                 'Slick',
                 'nf.Client',
                 'nf.Birdseye',
+                'nf.Storage',
                 'nf.Graph',
                 'nf.CanvasUtils',
                 'nf.ErrorHandler',
                 'nf.FilteredDialogCommon',
                 'nf.Dialog',
                 'nf.Common'],
-            function ($, Slick, nfClient, nfBirdseye, nfGraph, nfCanvasUtils, nfErrorHandler, nfFilteredDialogCommon, nfDialog, nfCommon) {
-                return (nf.ng.ProcessorComponent = factory($, Slick, nfClient, nfBirdseye, nfGraph, nfCanvasUtils, nfErrorHandler, nfFilteredDialogCommon, nfDialog, nfCommon));
+            function ($, Slick, nfClient, nfBirdseye, nfStorage, nfGraph, nfCanvasUtils, nfErrorHandler, nfFilteredDialogCommon, nfDialog, nfCommon) {
+                return (nf.ng.ProcessorComponent = factory($, Slick, nfClient, nfBirdseye, nfStorage, nfGraph, nfCanvasUtils, nfErrorHandler, nfFilteredDialogCommon, nfDialog, nfCommon));
             });
     } else if (typeof exports === 'object' && typeof module === 'object') {
         module.exports = (nf.ng.ProcessorComponent =
@@ -38,6 +39,7 @@
                 require('Slick'),
                 require('nf.Client'),
                 require('nf.Birdseye'),
+                require('nf.Storage'),
                 require('nf.Graph'),
                 require('nf.CanvasUtils'),
                 require('nf.ErrorHandler'),
@@ -49,6 +51,7 @@
             root.Slick,
             root.nf.Client,
             root.nf.Birdseye,
+            root.nf.Storage,
             root.nf.Graph,
             root.nf.CanvasUtils,
             root.nf.ErrorHandler,
@@ -56,7 +59,7 @@
             root.nf.Dialog,
             root.nf.Common);
     }
-}(this, function ($, Slick, nfClient, nfBirdseye, nfGraph, nfCanvasUtils, nfErrorHandler, nfFilteredDialogCommon, nfDialog, nfCommon) {
+}(this, function ($, Slick, nfClient, nfBirdseye, nfStorage, nfGraph, nfCanvasUtils, nfErrorHandler, nfFilteredDialogCommon, nfDialog, nfCommon) {
     'use strict';
 
     return function (serviceProvider) {
@@ -248,6 +251,7 @@
                         'version': 0
                     }
                 }),
+                'disconnectedNodeAcknowledged': nfStorage.isDisconnectionAcknowledged(),
                 'component': {
                     'type': processorType,
                     'bundle': bundle,
@@ -288,7 +292,7 @@
          * @param item process type
          */
         var isSelectable = function (item) {
-            return nfCommon.isBlank(item.usageRestriction) || nfCommon.canAccessRestrictedComponents();
+            return item.restricted === false || nfCommon.canAccessComponentRestrictions(item.explicitRestrictions);
         };
 
         function ProcessorComponent() {
@@ -436,9 +440,28 @@
                                 var item = processorTypesData.getItemById(rowId);
 
                                 // show the tooltip
-                                if (nfCommon.isDefinedAndNotNull(item.usageRestriction)) {
+                                if (item.restricted === true) {
+                                    var restrictionTip = $('<div></div>');
+
+                                    if (nfCommon.isBlank(item.usageRestriction)) {
+                                        restrictionTip.append($('<p style="margin-bottom: 3px;"></p>').text('Requires the following permissions:'));
+                                    } else {
+                                        restrictionTip.append($('<p style="margin-bottom: 3px;"></p>').text(item.usageRestriction + ' Requires the following permissions:'));
+                                    }
+
+                                    var restrictions = [];
+                                    if (nfCommon.isDefinedAndNotNull(item.explicitRestrictions)) {
+                                        $.each(item.explicitRestrictions, function (_, explicitRestriction) {
+                                            var requiredPermission = explicitRestriction.requiredPermission;
+                                            restrictions.push("'" + requiredPermission.label + "' - " + nfCommon.escapeHtml(explicitRestriction.explanation));
+                                        });
+                                    } else {
+                                        restrictions.push('Access to restricted components regardless of restrictions.');
+                                    }
+                                    restrictionTip.append(nfCommon.formatUnorderedList(restrictions));
+
                                     usageRestriction.qtip($.extend({}, nfCommon.config.tooltipConfig, {
-                                        content: item.usageRestriction,
+                                        content: restrictionTip,
                                         position: {
                                             container: $('#summary'),
                                             at: 'bottom right',
@@ -453,6 +476,8 @@
                             }
                         });
 
+                        var generalRestriction = nfCommon.getPolicyTypeListing('restricted-components');
+
                         // load the available processor types, this select is shown in the
                         // new processor dialog when a processor is dragged onto the screen
                         $.ajax({
@@ -462,6 +487,8 @@
                         }).done(function (response) {
                             var tags = [];
                             var groups = d3.set();
+                            var restrictedUsage = d3.map();
+                            var requiredPermissions = d3.map();
 
                             // begin the update
                             processorTypesData.beginUpdate();
@@ -469,6 +496,46 @@
                             // go through each processor type
                             $.each(response.processorTypes, function (i, documentedType) {
                                 var type = documentedType.type;
+
+                                if (documentedType.restricted === true) {
+                                    if (nfCommon.isDefinedAndNotNull(documentedType.explicitRestrictions)) {
+                                        $.each(documentedType.explicitRestrictions, function (_, explicitRestriction) {
+                                            var requiredPermission = explicitRestriction.requiredPermission;
+
+                                            // update required permissions
+                                            if (!requiredPermissions.has(requiredPermission.id)) {
+                                                requiredPermissions.set(requiredPermission.id, requiredPermission.label);
+                                            }
+
+                                            // update component restrictions
+                                            if (!restrictedUsage.has(requiredPermission.id)) {
+                                                restrictedUsage.set(requiredPermission.id, []);
+                                            }
+
+                                            restrictedUsage.get(requiredPermission.id).push({
+                                                type: nfCommon.formatType(documentedType),
+                                                bundle: nfCommon.formatBundle(documentedType.bundle),
+                                                explanation: nfCommon.escapeHtml(explicitRestriction.explanation)
+                                            })
+                                        });
+                                    } else {
+                                        // update required permissions
+                                        if (!requiredPermissions.has(generalRestriction.value)) {
+                                            requiredPermissions.set(generalRestriction.value, generalRestriction.text);
+                                        }
+
+                                        // update component restrictions
+                                        if (!restrictedUsage.has(generalRestriction.value)) {
+                                            restrictedUsage.set(generalRestriction.value, []);
+                                        }
+
+                                        restrictedUsage.get(generalRestriction.value).push({
+                                            type: nfCommon.formatType(documentedType),
+                                            bundle: nfCommon.formatBundle(documentedType.bundle),
+                                            explanation: nfCommon.escapeHtml(documentedType.usageRestriction)
+                                        });
+                                    }
+                                }
 
                                 // record the group
                                 groups.add(documentedType.bundle.group);
@@ -480,7 +547,9 @@
                                     type: type,
                                     bundle: documentedType.bundle,
                                     description: nfCommon.escapeHtml(documentedType.description),
+                                    restricted:  documentedType.restricted,
                                     usageRestriction: nfCommon.escapeHtml(documentedType.usageRestriction),
+                                    explicitRestrictions: documentedType.explicitRestrictions,
                                     tags: documentedType.tags.join(', ')
                                 });
 
@@ -496,6 +565,9 @@
                             // resort
                             processorTypesData.reSort();
                             processorTypesGrid.invalidate();
+
+                            // set the component restrictions and the corresponding required permissions
+                            nfCanvasUtils.addComponentRestrictions(restrictedUsage, requiredPermissions);
 
                             // set the total number of processors
                             $('#total-processor-types, #displayed-processor-types').text(response.processorTypes.length);

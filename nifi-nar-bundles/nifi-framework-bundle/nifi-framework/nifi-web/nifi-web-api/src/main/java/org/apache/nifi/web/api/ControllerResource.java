@@ -46,8 +46,8 @@ import org.apache.nifi.web.api.entity.ControllerServiceEntity;
 import org.apache.nifi.web.api.entity.Entity;
 import org.apache.nifi.web.api.entity.HistoryEntity;
 import org.apache.nifi.web.api.entity.NodeEntity;
-import org.apache.nifi.web.api.entity.RegistryClientsEntity;
 import org.apache.nifi.web.api.entity.RegistryClientEntity;
+import org.apache.nifi.web.api.entity.RegistryClientsEntity;
 import org.apache.nifi.web.api.entity.ReportingTaskEntity;
 import org.apache.nifi.web.api.request.ClientIdParameter;
 import org.apache.nifi.web.api.request.DateTimeParameter;
@@ -188,6 +188,8 @@ public class ControllerResource extends ApplicationResource {
 
         if (isReplicateRequest()) {
             return replicate(HttpMethod.PUT, requestConfigEntity);
+        } else if (isDisconnectedFromCluster()) {
+            verifyDisconnectedNodeModification(requestConfigEntity.isDisconnectedNodeAcknowledged());
         }
 
         final Revision requestRevision = getRevision(requestConfigEntity.getRevision(), FlowController.class.getSimpleName());
@@ -264,6 +266,8 @@ public class ControllerResource extends ApplicationResource {
 
         if (isReplicateRequest()) {
             return replicate(HttpMethod.POST, requestReportingTaskEntity);
+        } else if (isDisconnectedFromCluster()) {
+            verifyDisconnectedNodeModification(requestReportingTaskEntity.isDisconnectedNodeAcknowledged());
         }
 
         return withWriteLock(
@@ -277,7 +281,7 @@ public class ControllerResource extends ApplicationResource {
                         authorizable = lookup.getConfigurableComponent(requestReportingTask.getType(), requestReportingTask.getBundle());
 
                         if (authorizable.isRestricted()) {
-                            lookup.getRestrictedComponents().authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
+                            authorizeRestrictions(authorizer, authorizable);
                         }
 
                         if (requestReportingTask.getProperties() != null) {
@@ -397,6 +401,8 @@ public class ControllerResource extends ApplicationResource {
 
         if (isReplicateRequest()) {
             return replicate(HttpMethod.POST, requestRegistryClientEntity);
+        } else if (isDisconnectedFromCluster()) {
+            verifyDisconnectedNodeModification(requestRegistryClientEntity.isDisconnectedNodeAcknowledged());
         }
 
         return withWriteLock(
@@ -527,6 +533,8 @@ public class ControllerResource extends ApplicationResource {
 
         if (isReplicateRequest()) {
             return replicate(HttpMethod.PUT, requestRegistryEntity);
+        } else if (isDisconnectedFromCluster()) {
+            verifyDisconnectedNodeModification(requestRegistryEntity.isDisconnectedNodeAcknowledged());
         }
 
         if (requestRegistryClient.getName() != null && StringUtils.isBlank(requestRegistryClient.getName())) {
@@ -604,6 +612,11 @@ public class ControllerResource extends ApplicationResource {
             )
             @QueryParam(CLIENT_ID) @DefaultValue(StringUtils.EMPTY) final ClientIdParameter clientId,
             @ApiParam(
+                    value = "Acknowledges that this node is disconnected to allow for mutable requests to proceed.",
+                    required = false
+            )
+            @QueryParam(DISCONNECTED_NODE_ACKNOWLEDGED) @DefaultValue("false") final Boolean disconnectedNodeAcknowledged,
+            @ApiParam(
                     value = "The registry id.",
                     required = true
             )
@@ -611,6 +624,8 @@ public class ControllerResource extends ApplicationResource {
 
         if (isReplicateRequest()) {
             return replicate(HttpMethod.DELETE);
+        } else if (isDisconnectedFromCluster()) {
+            verifyDisconnectedNodeModification(disconnectedNodeAcknowledged);
         }
 
         final RegistryClientEntity requestRegistryClientEntity = new RegistryClientEntity();
@@ -762,6 +777,8 @@ public class ControllerResource extends ApplicationResource {
 
         if (isReplicateRequest()) {
             return replicate(HttpMethod.POST, requestControllerServiceEntity);
+        } else if (isDisconnectedFromCluster()) {
+            verifyDisconnectedNodeModification(requestControllerServiceEntity.isDisconnectedNodeAcknowledged());
         }
 
         return withWriteLock(
@@ -775,7 +792,7 @@ public class ControllerResource extends ApplicationResource {
                         authorizable = lookup.getConfigurableComponent(requestControllerService.getType(), requestControllerService.getBundle());
 
                         if (authorizable.isRestricted()) {
-                            lookup.getRestrictedComponents().authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
+                            authorizeRestrictions(authorizer, authorizable);
                         }
 
                         if (requestControllerService.getProperties() != null) {

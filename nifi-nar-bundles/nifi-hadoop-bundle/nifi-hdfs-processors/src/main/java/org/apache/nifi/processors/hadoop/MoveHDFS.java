@@ -16,6 +16,38 @@
  */
 package org.apache.nifi.processors.hadoop;
 
+import com.google.common.base.Preconditions;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.FileUtil;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.PathFilter;
+import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.nifi.annotation.behavior.InputRequirement;
+import org.apache.nifi.annotation.behavior.InputRequirement.Requirement;
+import org.apache.nifi.annotation.behavior.ReadsAttribute;
+import org.apache.nifi.annotation.behavior.Restricted;
+import org.apache.nifi.annotation.behavior.Restriction;
+import org.apache.nifi.annotation.behavior.WritesAttribute;
+import org.apache.nifi.annotation.behavior.WritesAttributes;
+import org.apache.nifi.annotation.documentation.CapabilityDescription;
+import org.apache.nifi.annotation.documentation.SeeAlso;
+import org.apache.nifi.annotation.documentation.Tags;
+import org.apache.nifi.annotation.lifecycle.OnScheduled;
+import org.apache.nifi.components.AllowableValue;
+import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.components.RequiredPermission;
+import org.apache.nifi.expression.ExpressionLanguageScope;
+import org.apache.nifi.flowfile.FlowFile;
+import org.apache.nifi.flowfile.attributes.CoreAttributes;
+import org.apache.nifi.processor.ProcessContext;
+import org.apache.nifi.processor.ProcessSession;
+import org.apache.nifi.processor.Relationship;
+import org.apache.nifi.processor.exception.ProcessException;
+import org.apache.nifi.processor.util.StandardValidators;
+import org.apache.nifi.util.StopWatch;
+
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.security.PrivilegedAction;
@@ -32,42 +64,25 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Pattern;
 
-import com.google.common.base.Preconditions;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.FileUtil;
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.fs.PathFilter;
-import org.apache.hadoop.security.UserGroupInformation;
-import org.apache.nifi.annotation.behavior.ReadsAttribute;
-import org.apache.nifi.annotation.behavior.WritesAttribute;
-import org.apache.nifi.annotation.behavior.WritesAttributes;
-import org.apache.nifi.annotation.documentation.CapabilityDescription;
-import org.apache.nifi.annotation.documentation.SeeAlso;
-import org.apache.nifi.annotation.documentation.Tags;
-import org.apache.nifi.annotation.lifecycle.OnScheduled;
-import org.apache.nifi.components.AllowableValue;
-import org.apache.nifi.components.PropertyDescriptor;
-import org.apache.nifi.flowfile.FlowFile;
-import org.apache.nifi.flowfile.attributes.CoreAttributes;
-import org.apache.nifi.processor.ProcessContext;
-import org.apache.nifi.processor.ProcessSession;
-import org.apache.nifi.processor.Relationship;
-import org.apache.nifi.processor.exception.ProcessException;
-import org.apache.nifi.processor.util.StandardValidators;
-import org.apache.nifi.util.StopWatch;
-
 /**
  * This processor renames files on HDFS.
  */
-@Tags({"hadoop", "HDFS", "put", "move", "filesystem", "restricted", "moveHDFS"})
+@InputRequirement(Requirement.INPUT_ALLOWED)
+@Tags({"hadoop", "HDFS", "put", "move", "filesystem", "moveHDFS"})
 @CapabilityDescription("Rename existing files or a directory of files (non-recursive) on Hadoop Distributed File System (HDFS).")
 @ReadsAttribute(attribute = "filename", description = "The name of the file written to HDFS comes from the value of this attribute.")
 @WritesAttributes({
         @WritesAttribute(attribute = "filename", description = "The name of the file written to HDFS is stored in this attribute."),
         @WritesAttribute(attribute = "absolute.hdfs.path", description = "The absolute path to the file on HDFS is stored in this attribute.")})
 @SeeAlso({PutHDFS.class, GetHDFS.class})
+@Restricted(restrictions = {
+    @Restriction(
+        requiredPermission = RequiredPermission.READ_FILESYSTEM,
+        explanation = "Provides operator the ability to retrieve any file that NiFi has access to in HDFS or the local filesystem."),
+    @Restriction(
+        requiredPermission = RequiredPermission.WRITE_FILESYSTEM,
+        explanation = "Provides operator the ability to delete any file that NiFi has access to in HDFS or the local filesystem.")
+})
 public class MoveHDFS extends AbstractHadoopProcessor {
 
     // static global
@@ -87,19 +102,23 @@ public class MoveHDFS extends AbstractHadoopProcessor {
     public static final String ABSOLUTE_HDFS_PATH_ATTRIBUTE = "absolute.hdfs.path";
 
     // relationships
-    public static final Relationship REL_SUCCESS = new Relationship.Builder().name("success")
+    public static final Relationship REL_SUCCESS = new Relationship.Builder()
+            .name("success")
             .description("Files that have been successfully renamed on HDFS are transferred to this relationship")
             .build();
 
-    public static final Relationship REL_FAILURE = new Relationship.Builder().name("failure")
-            .description("Files that could not be renamed on HDFS are transferred to this relationship").build();
+    public static final Relationship REL_FAILURE = new Relationship.Builder()
+            .name("failure")
+            .description("Files that could not be renamed on HDFS are transferred to this relationship")
+            .build();
 
     // properties
     public static final PropertyDescriptor CONFLICT_RESOLUTION = new PropertyDescriptor.Builder()
             .name("Conflict Resolution Strategy")
             .description(
                     "Indicates what should happen when a file with the same name already exists in the output directory")
-            .required(true).defaultValue(FAIL_RESOLUTION_AV.getValue())
+            .required(true)
+            .defaultValue(FAIL_RESOLUTION_AV.getValue())
             .allowableValues(REPLACE_RESOLUTION_AV, IGNORE_RESOLUTION_AV, FAIL_RESOLUTION_AV).build();
 
     public static final PropertyDescriptor FILE_FILTER_REGEX = new PropertyDescriptor.Builder()
@@ -107,37 +126,56 @@ public class MoveHDFS extends AbstractHadoopProcessor {
             .description(
                     "A Java Regular Expression for filtering Filenames; if a filter is supplied then only files whose names match that Regular "
                             + "Expression will be fetched, otherwise all files will be fetched")
-            .required(false).addValidator(StandardValidators.REGULAR_EXPRESSION_VALIDATOR).build();
+            .required(false)
+            .addValidator(StandardValidators.REGULAR_EXPRESSION_VALIDATOR)
+            .build();
 
     public static final PropertyDescriptor IGNORE_DOTTED_FILES = new PropertyDescriptor.Builder()
             .name("Ignore Dotted Files")
-            .description("If true, files whose names begin with a dot (\".\") will be ignored").required(true)
-            .allowableValues("true", "false").defaultValue("true").build();
+            .description("If true, files whose names begin with a dot (\".\") will be ignored")
+            .required(true)
+            .allowableValues("true", "false")
+            .defaultValue("true")
+            .build();
 
     public static final PropertyDescriptor INPUT_DIRECTORY_OR_FILE = new PropertyDescriptor.Builder()
             .name("Input Directory or File")
             .description("The HDFS directory from which files should be read, or a single file to read.")
-            .defaultValue("${path}").addValidator(StandardValidators.ATTRIBUTE_EXPRESSION_LANGUAGE_VALIDATOR)
-            .expressionLanguageSupported(true).build();
-
-    public static final PropertyDescriptor OUTPUT_DIRECTORY = new PropertyDescriptor.Builder().name("Output Directory")
-            .description("The HDFS directory where the files will be moved to").required(true)
-            .addValidator(StandardValidators.ATTRIBUTE_EXPRESSION_LANGUAGE_VALIDATOR).expressionLanguageSupported(true)
+            .defaultValue("${path}")
+            .required(true)
+            .addValidator(StandardValidators.ATTRIBUTE_EXPRESSION_LANGUAGE_VALIDATOR)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 
-    public static final PropertyDescriptor OPERATION = new PropertyDescriptor.Builder().name("HDFS Operation")
-            .description("The operation that will be performed on the source file").required(true)
-            .allowableValues("move", "copy").defaultValue("move").build();
+    public static final PropertyDescriptor OUTPUT_DIRECTORY = new PropertyDescriptor.Builder()
+            .name("Output Directory")
+            .description("The HDFS directory where the files will be moved to")
+            .required(true)
+            .addValidator(StandardValidators.ATTRIBUTE_EXPRESSION_LANGUAGE_VALIDATOR)
+            .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
+            .build();
 
-    public static final PropertyDescriptor REMOTE_OWNER = new PropertyDescriptor.Builder().name("Remote Owner")
+    public static final PropertyDescriptor OPERATION = new PropertyDescriptor.Builder()
+            .name("HDFS Operation")
+            .description("The operation that will be performed on the source file")
+            .required(true)
+            .allowableValues("move", "copy")
+            .defaultValue("move")
+            .build();
+
+    public static final PropertyDescriptor REMOTE_OWNER = new PropertyDescriptor.Builder()
+            .name("Remote Owner")
             .description(
                     "Changes the owner of the HDFS file to this value after it is written. This only works if NiFi is running as a user that has HDFS super user privilege to change owner")
-            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR).build();
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
 
-    public static final PropertyDescriptor REMOTE_GROUP = new PropertyDescriptor.Builder().name("Remote Group")
+    public static final PropertyDescriptor REMOTE_GROUP = new PropertyDescriptor.Builder()
+            .name("Remote Group")
             .description(
                     "Changes the group of the HDFS file to this value after it is written. This only works if NiFi is running as a user that has HDFS super user privilege to change group")
-            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR).build();
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
 
     static {
         final Set<Relationship> rels = new HashSet<>();
@@ -194,14 +232,16 @@ public class MoveHDFS extends AbstractHadoopProcessor {
 
     @Override
     public void onTrigger(ProcessContext context, ProcessSession session) throws ProcessException {
-        // MoveHDFS
-        FlowFile parentFlowFile = session.get();
-        if (parentFlowFile == null) {
+        FlowFile flowFile = session.get();
+
+        if (flowFile == null && context.hasIncomingConnection()) {
             return;
         }
 
+        flowFile = (flowFile != null) ? flowFile : session.create();
+
         final FileSystem hdfs = getFileSystem();
-        final String filenameValue = context.getProperty(INPUT_DIRECTORY_OR_FILE).evaluateAttributeExpressions(parentFlowFile).getValue();
+        final String filenameValue = context.getProperty(INPUT_DIRECTORY_OR_FILE).evaluateAttributeExpressions(flowFile).getValue();
 
         Path inputPath = null;
         try {
@@ -210,10 +250,10 @@ public class MoveHDFS extends AbstractHadoopProcessor {
                 throw new IOException("Input Directory or File does not exist in HDFS");
             }
         } catch (Exception e) {
-            getLogger().error("Failed to retrieve content from {} for {} due to {}; routing to failure", new Object[]{filenameValue, parentFlowFile, e});
-            parentFlowFile = session.putAttribute(parentFlowFile, "hdfs.failure.reason", e.getMessage());
-            parentFlowFile = session.penalize(parentFlowFile);
-            session.transfer(parentFlowFile, REL_FAILURE);
+            getLogger().error("Failed to retrieve content from {} for {} due to {}; routing to failure", new Object[]{filenameValue, flowFile, e});
+            flowFile = session.putAttribute(flowFile, "hdfs.failure.reason", e.getMessage());
+            flowFile = session.penalize(flowFile);
+            session.transfer(flowFile, REL_FAILURE);
             return;
         }
 
@@ -264,7 +304,7 @@ public class MoveHDFS extends AbstractHadoopProcessor {
             filePathQueue.drainTo(files);
             if (files.isEmpty()) {
                 // nothing to do!
-                session.remove(parentFlowFile);
+                session.remove(flowFile);
                 context.yield();
                 return;
             }
@@ -272,7 +312,7 @@ public class MoveHDFS extends AbstractHadoopProcessor {
             queueLock.unlock();
         }
 
-        processBatchOfFiles(files, context, session, parentFlowFile);
+        processBatchOfFiles(files, context, session, flowFile);
 
         queueLock.lock();
         try {
@@ -281,7 +321,7 @@ public class MoveHDFS extends AbstractHadoopProcessor {
             queueLock.unlock();
         }
 
-        session.remove(parentFlowFile);
+        session.remove(flowFile);
     }
 
     protected void processBatchOfFiles(final List<Path> files, final ProcessContext context,
@@ -462,7 +502,6 @@ public class MoveHDFS extends AbstractHadoopProcessor {
 
         final private String conflictResolution;
         final private String operation;
-        final private Path inputRootDirPath;
         final private Path outputRootDirPath;
         final private Pattern fileFilterPattern;
         final private boolean ignoreDottedFiles;
@@ -470,8 +509,6 @@ public class MoveHDFS extends AbstractHadoopProcessor {
         ProcessorConfiguration(final ProcessContext context) {
             conflictResolution = context.getProperty(CONFLICT_RESOLUTION).getValue();
             operation = context.getProperty(OPERATION).getValue();
-            final String inputDirValue = context.getProperty(INPUT_DIRECTORY_OR_FILE).evaluateAttributeExpressions().getValue();
-            inputRootDirPath = new Path(inputDirValue);
             final String outputDirValue = context.getProperty(OUTPUT_DIRECTORY).evaluateAttributeExpressions().getValue();
             outputRootDirPath = new Path(outputDirValue);
             final String fileFilterRegex = context.getProperty(FILE_FILTER_REGEX).getValue();
@@ -485,10 +522,6 @@ public class MoveHDFS extends AbstractHadoopProcessor {
 
         public String getConflictResolution() {
             return conflictResolution;
-        }
-
-        public Path getInput() {
-            return inputRootDirPath;
         }
 
         public Path getOutputDirectory() {

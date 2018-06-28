@@ -24,6 +24,7 @@
                 'd3',
                 'nf.Client',
                 'nf.Dialog',
+                'nf.Storage',
                 'nf.Common',
                 'nf.CanvasUtils',
                 'nf.ControllerServices',
@@ -34,8 +35,8 @@
                 'nf.ComponentState',
                 'nf.ComponentVersion',
                 'nf.PolicyManagement'],
-            function ($, Slick, d3, nfClient, nfDialog, nfCommon, nfCanvasUtils, nfControllerServices, nfErrorHandler, nfFilteredDialogCommon, nfReportingTask, nfShell, nfComponentState, nfComponentVersion, nfPolicyManagement) {
-                return (nf.Settings = factory($, Slick, d3, nfClient, nfDialog, nfCommon, nfCanvasUtils, nfControllerServices, nfErrorHandler, nfFilteredDialogCommon, nfReportingTask, nfShell, nfComponentState, nfComponentVersion, nfPolicyManagement));
+            function ($, Slick, d3, nfClient, nfDialog, nfStorage, nfCommon, nfCanvasUtils, nfControllerServices, nfErrorHandler, nfFilteredDialogCommon, nfReportingTask, nfShell, nfComponentState, nfComponentVersion, nfPolicyManagement) {
+                return (nf.Settings = factory($, Slick, d3, nfClient, nfDialog, nfStorage, nfCommon, nfCanvasUtils, nfControllerServices, nfErrorHandler, nfFilteredDialogCommon, nfReportingTask, nfShell, nfComponentState, nfComponentVersion, nfPolicyManagement));
             });
     } else if (typeof exports === 'object' && typeof module === 'object') {
         module.exports = (nf.Settings =
@@ -44,6 +45,7 @@
                 require('d3'),
                 require('nf.Client'),
                 require('nf.Dialog'),
+                require('nf.Storage'),
                 require('nf.Common'),
                 require('nf.CanvasUtils'),
                 require('nf.ControllerServices'),
@@ -60,6 +62,7 @@
             root.d3,
             root.nf.Client,
             root.nf.Dialog,
+            root.nf.Storage,
             root.nf.Common,
             root.nf.CanvasUtils,
             root.nf.ControllerServices,
@@ -71,7 +74,7 @@
             root.nf.ComponentVersion,
             root.nf.PolicyManagement);
     }
-}(this, function ($, Slick, d3, nfClient, nfDialog, nfCommon, nfCanvasUtils, nfControllerServices, nfErrorHandler, nfFilteredDialogCommon, nfReportingTask, nfShell, nfComponentState, nfComponentVersion, nfPolicyManagement) {
+}(this, function ($, Slick, d3, nfClient, nfDialog, nfStorage, nfCommon, nfCanvasUtils, nfControllerServices, nfErrorHandler, nfFilteredDialogCommon, nfReportingTask, nfShell, nfComponentState, nfComponentVersion, nfPolicyManagement) {
     'use strict';
 
 
@@ -119,6 +122,7 @@
                     'version': version
                 }
             }),
+            'disconnectedNodeAcknowledged': nfStorage.isDisconnectionAcknowledged(),
             'component': configuration
         };
 
@@ -218,7 +222,7 @@
      * @param item reporting task type
      */
     var isSelectable = function (item) {
-        return nfCommon.isBlank(item.usageRestriction) || nfCommon.canAccessRestrictedComponents();
+        return item.restricted === false || nfCommon.canAccessComponentRestrictions(item.explicitRestrictions);
     };
 
     /**
@@ -264,12 +268,20 @@
                     var bType = nfCommon.isDefinedAndNotNull(b.component[sortDetails.columnId]) ? nfCommon.substringAfterLast(b.component[sortDetails.columnId], '.') : '';
                     return aType === bType ? 0 : aType > bType ? 1 : -1;
                 } else if (sortDetails.columnId === 'state') {
-                    var aState = 'Invalid';
-                    if (nfCommon.isEmpty(a.component.validationErrors)) {
+                    var aState;
+                    if (a.component.validationStatus === 'VALIDATING') {
+                        aState = 'Validating';
+                    } else if (a.component.validationStatus === 'INVALID') {
+                        aState = 'Invalid';
+                    } else {
                         aState = nfCommon.isDefinedAndNotNull(a.component[sortDetails.columnId]) ? a.component[sortDetails.columnId] : '';
                     }
-                    var bState = 'Invalid';
-                    if (nfCommon.isEmpty(b.component.validationErrors)) {
+                    var bState;
+                    if (b.component.validationStatus === 'VALIDATING') {
+                        bState = 'Validating';
+                    } else if (b.component.validationStatus === 'INVALID') {
+                        bState = 'Invalid';
+                    } else {
                         bState = nfCommon.isDefinedAndNotNull(b.component[sortDetails.columnId]) ? b.component[sortDetails.columnId] : '';
                     }
                     return aState === bState ? 0 : aState > bState ? 1 : -1;
@@ -427,6 +439,7 @@
                     'version': 0
                 }
             }),
+            'disconnectedNodeAcknowledged': nfStorage.isDisconnectionAcknowledged(),
             'component': {
                 'type': reportingTaskType,
                 'bundle': reportingTaskBundle
@@ -475,6 +488,7 @@
                     'version': 0
                 }
             }),
+            'disconnectedNodeAcknowledged': nfStorage.isDisconnectionAcknowledged(),
             'component': {
                 'name': $('#registry-name').val(),
                 'uri': $('#registry-location').val(),
@@ -525,6 +539,7 @@
         var registryEntity = registriesData.getItemById(registryId);
         var requestRegistryEntity = {
             'revision': nfClient.getRevision(registryEntity),
+            'disconnectedNodeAcknowledged': nfStorage.isDisconnectionAcknowledged(),
             'component': {
                 'id': registryId,
                 'name': $('#registry-name').val(),
@@ -682,9 +697,28 @@
                 var item = reportingTaskTypesData.getItemById(rowId);
 
                 // show the tooltip
-                if (nfCommon.isDefinedAndNotNull(item.usageRestriction)) {
+                if (item.restricted === true) {
+                    var restrictionTip = $('<div></div>');
+
+                    if (nfCommon.isBlank(item.usageRestriction)) {
+                        restrictionTip.append($('<p style="margin-bottom: 3px;"></p>').text('Requires the following permissions:'));
+                    } else {
+                        restrictionTip.append($('<p style="margin-bottom: 3px;"></p>').text(item.usageRestriction + ' Requires the following permissions:'));
+                    }
+
+                    var restrictions = [];
+                    if (nfCommon.isDefinedAndNotNull(item.explicitRestrictions)) {
+                        $.each(item.explicitRestrictions, function (_, explicitRestriction) {
+                            var requiredPermission = explicitRestriction.requiredPermission;
+                            restrictions.push("'" + requiredPermission.label + "' - " + nfCommon.escapeHtml(explicitRestriction.explanation));
+                        });
+                    } else {
+                        restrictions.push('Access to restricted components regardless of restrictions.');
+                    }
+                    restrictionTip.append(nfCommon.formatUnorderedList(restrictions));
+
                     usageRestriction.qtip($.extend({}, nfCommon.config.tooltipConfig, {
-                        content: item.usageRestriction,
+                        content: restrictionTip,
                         position: {
                             container: $('#summary'),
                             at: 'bottom right',
@@ -699,6 +733,8 @@
             }
         });
 
+        var generalRestriction = nfCommon.getPolicyTypeListing('restricted-components');
+
         // load the available reporting tasks
         $.ajax({
             type: 'GET',
@@ -708,12 +744,54 @@
             var id = 0;
             var tags = [];
             var groups = d3.set();
+            var restrictedUsage = d3.map();
+            var requiredPermissions = d3.map();
 
             // begin the update
             reportingTaskTypesData.beginUpdate();
 
             // go through each reporting task type
             $.each(response.reportingTaskTypes, function (i, documentedType) {
+                if (documentedType.restricted === true) {
+                    if (nfCommon.isDefinedAndNotNull(documentedType.explicitRestrictions)) {
+                        $.each(documentedType.explicitRestrictions, function (_, explicitRestriction) {
+                            var requiredPermission = explicitRestriction.requiredPermission;
+
+                            // update required permissions
+                            if (!requiredPermissions.has(requiredPermission.id)) {
+                                requiredPermissions.set(requiredPermission.id, requiredPermission.label);
+                            }
+
+                            // update component restrictions
+                            if (!restrictedUsage.has(requiredPermission.id)) {
+                                restrictedUsage.set(requiredPermission.id, []);
+                            }
+
+                            restrictedUsage.get(requiredPermission.id).push({
+                                type: nfCommon.formatType(documentedType),
+                                bundle: nfCommon.formatBundle(documentedType.bundle),
+                                explanation: nfCommon.escapeHtml(explicitRestriction.explanation)
+                            })
+                        });
+                    } else {
+                        // update required permissions
+                        if (!requiredPermissions.has(generalRestriction.value)) {
+                            requiredPermissions.set(generalRestriction.value, generalRestriction.text);
+                        }
+
+                        // update component restrictions
+                        if (!restrictedUsage.has(generalRestriction.value)) {
+                            restrictedUsage.set(generalRestriction.value, []);
+                        }
+
+                        restrictedUsage.get(generalRestriction.value).push({
+                            type: nfCommon.formatType(documentedType),
+                            bundle: nfCommon.formatBundle(documentedType.bundle),
+                            explanation: nfCommon.escapeHtml(documentedType.usageRestriction)
+                        });
+                    }
+                }
+
                 // record the group
                 groups.add(documentedType.bundle.group);
 
@@ -724,7 +802,9 @@
                     type: documentedType.type,
                     bundle: documentedType.bundle,
                     description: nfCommon.escapeHtml(documentedType.description),
+                    restricted:  documentedType.restricted,
                     usageRestriction: nfCommon.escapeHtml(documentedType.usageRestriction),
+                    explicitRestrictions: documentedType.explicitRestrictions,
                     tags: documentedType.tags.join(', ')
                 });
 
@@ -740,6 +820,9 @@
             // resort
             reportingTaskTypesData.reSort();
             reportingTaskTypesGrid.invalidate();
+
+            // set the component restrictions and the corresponding required permissions
+            nfCanvasUtils.addComponentRestrictions(restrictedUsage, requiredPermissions);
 
             // set the total number of processors
             $('#total-reporting-task-types, #displayed-reporting-task-types').text(response.reportingTaskTypes.length);
@@ -929,9 +1012,12 @@
 
             // determine the appropriate label
             var icon = '', label = '';
-            if (!nfCommon.isEmpty(dataContext.component.validationErrors)) {
-                label = 'Invalid';
+            if (dataContext.component.validationStatus === 'VALIDATING') {
+                icon = 'validating fa fa-spin fa-circle-notch';
+                label = 'Validating';
+            } else if (dataContext.component.validationStatus === 'INVALID') {
                 icon = 'invalid fa fa-warning';
+                label = 'Invalid';
             } else {
                 if (dataContext.component.state === 'STOPPED') {
                     label = 'Stopped';
@@ -952,8 +1038,8 @@
             }
 
             // format the markup
-            var formattedValue = '<div layout="row"><div class="' + icon + '" style="margin-top: 3px;"></div>';
-            return formattedValue + '<div class="status-text" style="margin-top: 4px;">' + nfCommon.escapeHtml(label) + '</div><div style="float: left; margin-left: 4px;">' + nfCommon.escapeHtml(activeThreadCount) + '</div></div>';
+            var formattedValue = '<div layout="row"><div class="' + icon + '"></div>';
+            return formattedValue + '<div class="status-text">' + nfCommon.escapeHtml(label) + '</div><div style="float: left; margin-left: 4px;">' + nfCommon.escapeHtml(activeThreadCount) + '</div></div>';
         };
 
         var reportingTaskActionFormatter = function (row, cell, value, columnDef, dataContext) {
@@ -961,32 +1047,32 @@
 
             if (dataContext.permissions.canRead && dataContext.permissions.canWrite) {
                 if (dataContext.component.state === 'RUNNING') {
-                    markup += '<div title="Stop" class="pointer stop-reporting-task fa fa-stop" style="margin-top: 2px; margin-right: 3px;" ></div>';
+                    markup += '<div title="Stop" class="pointer stop-reporting-task fa fa-stop"></div>';
                 } else if (dataContext.component.state === 'STOPPED' || dataContext.component.state === 'DISABLED') {
-                    markup += '<div title="Edit" class="pointer edit-reporting-task fa fa-pencil" style="margin-top: 2px; margin-right: 3px;" ></div>';
+                    markup += '<div title="Edit" class="pointer edit-reporting-task fa fa-pencil"></div>';
 
                     // support starting when stopped and no validation errors
                     if (dataContext.component.state === 'STOPPED' && nfCommon.isEmpty(dataContext.component.validationErrors)) {
-                        markup += '<div title="Start" class="pointer start-reporting-task fa fa-play" style="margin-top: 2px; margin-right: 3px;"></div>';
+                        markup += '<div title="Start" class="pointer start-reporting-task fa fa-play"></div>';
                     }
 
                     if (dataContext.component.multipleVersionsAvailable === true) {
-                        markup += '<div title="Change Version" class="pointer change-version-reporting-task fa fa-exchange" style="margin-top: 2px; margin-right: 3px;" ></div>';
+                        markup += '<div title="Change Version" class="pointer change-version-reporting-task fa fa-exchange"></div>';
                     }
 
                     if (nfCommon.canModifyController()) {
-                        markup += '<div title="Remove" class="pointer delete-reporting-task fa fa-trash" style="margin-top: 2px; margin-right: 3px;" ></div>';
+                        markup += '<div title="Remove" class="pointer delete-reporting-task fa fa-trash"></div>';
                     }
                 }
 
                 if (dataContext.component.persistsState === true) {
-                    markup += '<div title="View State" class="pointer view-state-reporting-task fa fa-tasks" style="margin-top: 2px; margin-right: 3px;" ></div>';
+                    markup += '<div title="View State" class="pointer view-state-reporting-task fa fa-tasks"></div>';
                 }
             }
 
             // allow policy configuration conditionally
             if (nfCanvasUtils.isManagedAuthorizer() && nfCommon.canAccessTenants()) {
-                markup += '<div title="Access Policies" class="pointer edit-access-policies fa fa-key" style="margin-top: 2px;"></div>';
+                markup += '<div title="Access Policies" class="pointer edit-access-policies fa fa-key"></div>';
             }
 
             return markup;
@@ -1215,10 +1301,10 @@
 
             if (nfCommon.canModifyController()) {
                 // edit registry
-                markup += '<div title="Edit" class="pointer edit-registry fa fa-pencil" style="margin-top: 2px; margin-right: 3px;" ></div>';
+                markup += '<div title="Edit" class="pointer edit-registry fa fa-pencil"></div>';
 
                 // remove registry
-                markup += '<div title="Remove" class="pointer remove-registry fa fa-trash" style="margin-top: 2px; margin-right: 3px;" ></div>';
+                markup += '<div title="Remove" class="pointer remove-registry fa fa-trash"></div>';
             }
 
             return markup;
@@ -1402,8 +1488,9 @@
         $.ajax({
             type: 'DELETE',
             url: registryEntity.uri + '?' + $.param({
-                version: revision.version,
-                clientId: revision.clientId
+                'version': revision.version,
+                'clientId': revision.clientId,
+                'disconnectedNodeAcknowledged': nfStorage.isDisconnectionAcknowledged()
             }),
             dataType: 'json'
         }).done(function (response) {

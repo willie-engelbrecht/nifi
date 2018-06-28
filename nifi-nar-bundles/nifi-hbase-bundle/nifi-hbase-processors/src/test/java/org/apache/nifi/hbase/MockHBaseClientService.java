@@ -16,7 +16,6 @@
  */
 package org.apache.nifi.hbase;
 
-import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.nifi.controller.AbstractControllerService;
 import org.apache.nifi.hbase.put.PutColumn;
 import org.apache.nifi.hbase.put.PutFlowFile;
@@ -41,6 +40,8 @@ public class MockHBaseClientService extends AbstractControllerService implements
     private boolean throwExceptionDuringBatchDelete = false;
     private int numScans = 0;
     private int numPuts  = 0;
+    private int linesBeforeException = -1;
+
     @Override
     public void put(String tableName, Collection<PutFlowFile> puts) throws IOException {
         if (throwException) {
@@ -71,6 +72,9 @@ public class MockHBaseClientService extends AbstractControllerService implements
         throw new UnsupportedOperationException();
     }
 
+    @Override
+    public void delete(String tableName, byte[] rowId, String visibilityLabel) throws IOException { }
+
     private int deletePoint = 0;
     public void setDeletePoint(int deletePoint) {
         this.deletePoint = deletePoint;
@@ -97,6 +101,18 @@ public class MockHBaseClientService extends AbstractControllerService implements
         }
     }
 
+    @Override
+    public void deleteCells(String tableName, List<DeleteRequest> deletes) throws IOException {
+        for (DeleteRequest req : deletes) {
+            results.remove(new String(req.getRowId()));
+        }
+    }
+
+    @Override
+    public void delete(String tableName, List<byte[]> rowIds, String visibilityLabel) throws IOException {
+        delete(tableName, rowIds);
+    }
+
     public int size() {
         return results.size();
     }
@@ -106,7 +122,7 @@ public class MockHBaseClientService extends AbstractControllerService implements
     }
 
     @Override
-    public void scan(String tableName, byte[] startRow, byte[] endRow, Collection<Column> columns, ResultHandler handler) throws IOException {
+    public void scan(String tableName, byte[] startRow, byte[] endRow, Collection<Column> columns, List<String> labels, ResultHandler handler) throws IOException {
         if (throwException) {
             throw new IOException("exception");
         }
@@ -149,6 +165,33 @@ public class MockHBaseClientService extends AbstractControllerService implements
         for (final Map.Entry<String,ResultCell[]> entry : results.entrySet()) {
             handler.handle(entry.getKey().getBytes(StandardCharsets.UTF_8), entry.getValue());
         }
+
+        numScans++;
+    }
+
+    @Override
+    public void scan(String tableName, Collection<Column> columns, String filterExpression, long minTime, List<String> visibilityLabels, ResultHandler handler) throws IOException {
+        scan(tableName, columns, filterExpression, minTime, handler);
+    }
+
+    @Override
+    public void scan(String tableName, String startRow, String endRow, String filterExpression, Long timerangeMin,
+            Long timerangeMax, Integer limitRows, Boolean isReversed, Collection<Column> columns, List<String> visibilityLabels,  ResultHandler handler)
+            throws IOException {
+        if (throwException) {
+            throw new IOException("exception");
+        }
+
+        int i = 0;
+        // pass all the staged data to the handler
+        for (final Map.Entry<String, ResultCell[]> entry : results.entrySet()) {
+            if (linesBeforeException >= 0 && i++ >= linesBeforeException) {
+                throw new IOException("iterating exception");
+            }
+            handler.handle(entry.getKey().getBytes(StandardCharsets.UTF_8), entry.getValue());
+        }
+
+        // delegate to the handler
 
         numScans++;
     }
@@ -238,7 +281,7 @@ public class MockHBaseClientService extends AbstractControllerService implements
 
     @Override
     public byte[] toBytesBinary(String s) {
-       return Bytes.toBytesBinary(s);
+       return convertToBytesBinary(s);
     }
 
     private boolean testFailure = false;
@@ -257,5 +300,45 @@ public class MockHBaseClientService extends AbstractControllerService implements
 
     public void setThrowExceptionDuringBatchDelete(boolean throwExceptionDuringBatchDelete) {
         this.throwExceptionDuringBatchDelete = throwExceptionDuringBatchDelete;
+    }
+
+    public int getLinesBeforeException() {
+        return linesBeforeException;
+    }
+
+    public void setLinesBeforeException(int linesBeforeException) {
+        this.linesBeforeException = linesBeforeException;
+    }
+
+    private byte[] convertToBytesBinary(String in) {
+        byte[] b = new byte[in.length()];
+        int size = 0;
+
+        for(int i = 0; i < in.length(); ++i) {
+            char ch = in.charAt(i);
+            if (ch == '\\' && in.length() > i + 1 && in.charAt(i + 1) == 'x') {
+                char hd1 = in.charAt(i + 2);
+                char hd2 = in.charAt(i + 3);
+                if (isHexDigit(hd1) && isHexDigit(hd2)) {
+                    byte d = (byte)((toBinaryFromHex((byte)hd1) << 4) + toBinaryFromHex((byte)hd2));
+                    b[size++] = d;
+                    i += 3;
+                }
+            } else {
+                b[size++] = (byte)ch;
+            }
+        }
+
+        byte[] b2 = new byte[size];
+        System.arraycopy(b, 0, b2, 0, size);
+        return b2;
+    }
+
+    private static boolean isHexDigit(char c) {
+        return c >= 'A' && c <= 'F' || c >= '0' && c <= '9';
+    }
+
+    private static byte toBinaryFromHex(byte ch) {
+        return ch >= 65 && ch <= 70 ? (byte)(10 + (byte)(ch - 65)) : (byte)(ch - 48);
     }
 }
